@@ -29,6 +29,8 @@ target_link_libraries(lego_dbw
     pico_stdlib
     hardware_gpio
     hardware_timer
+    hardware_watchdog
+    hardware_sync
     pico_btstack_ble
     pico_btstack_cyw43
     pico_cyw43_arch_poll
