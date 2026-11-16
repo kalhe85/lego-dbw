@@ -4,6 +4,28 @@ Turns the **LEGO Technic 42160 Audi RS Q e-tron** into a drive-by-wire platform 
 
 A **Raspberry Pi Pico W** reads PWM outputs from an ArduPilot flight controller and drives the LEGO Technic Hub over BLE using the **LEGO Wireless Protocol 3 (LWP3)**. The gateway enforces safety gating, so the car can run under manual RC or a full autonomous stack.
 
+<p align="center">
+  <img src="docs/media/car-and-transmitter.jpg" alt="LEGO 42160 with the Pico W gateway installed, next to the RC transmitter" width="720">
+</p>
+
+## Demo
+
+Driving under manual RC through ArduPilot with the v2 firmware:
+
+<p align="center">
+  <a href="docs/media/demo.mp4"><img src="docs/media/demo.gif" alt="LEGO 42160 driving and steering under RC control" width="480"></a>
+  <br>
+  <sub>11-second preview. Click it or open <a href="docs/media/demo.mp4"><code>docs/media/demo.mp4</code></a> for the full 30-second clip.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/media/car.jpg" alt="Close-up of the car with the Pico W mounted in the cabin" width="560">
+  <br>
+  <sub>The Pico W gateway mounted in the cabin.</sub>
+</p>
+
+## Architecture
+
 ```
 [Matek F405 Mini / ArduPilot Rover]
         │ PWM: throttle, steering, enable (deadman)
@@ -376,11 +398,12 @@ A steadily rising `drop` counter means commands are produced faster than the lin
 ├── config/btstack_config.h   BTstack options
 ├── CMakeLists.txt            build definition
 ├── pico_sdk_import.cmake     standard SDK locator
-└── docs/review-v1.md         analysis of v1 problems (Vietnamese)
+├── docs/review-v1.md         analysis of v1 problems (Vietnamese)
+└── docs/media/               photos and demo video
 ```
 
 - **v1**: first working version (commit `3a9c55f`).
-- **v2**: stability rework. The control loop moved out of IRQ context, TX flow control and connection parameters were added, setup timeouts and a watchdog were introduced, and a PWM glitch that could command full reverse was fixed. See [`docs/review-v1.md`](docs/review-v1.md).
+- **v2**: stability rework. The control loop moved out of IRQ context, TX flow control and connection parameters were added, setup timeouts and a watchdog were introduced, and a PWM glitch that could command full reverse was fixed. See [`docs/review-v1.md`](docs/review-v1.md). Tested on the car in November 2026: drives and steers under RC (see [Demo](#demo)).
 
 ### Roadmap
 
