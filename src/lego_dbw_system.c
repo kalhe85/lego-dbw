@@ -1,19 +1,19 @@
-// lego_dbw_system_v2.c
-// Pico W PWM -> BLE LEGO Technic Hub (LWP3) Drive-by-Wire Gateway — v2 (stability rework)
+// lego_dbw_system.c
+// Pico W PWM -> BLE LEGO Technic Hub (LWP3) Drive-by-Wire Gateway — v1.0
 //
-// Changes vs v1:
-//  1. Control loop runs as a BTstack run-loop timer (same context as BTstack) instead of a
-//     repeating_timer IRQ. Nothing calls cyw43_arch_poll()/BTstack/printf from IRQ any more.
+// Design notes:
+//  1. The control loop runs as a BTstack run-loop timer (same context as BTstack), never from
+//     an IRQ. Nothing calls cyw43_arch_poll()/BTstack/printf from interrupt context.
 //  2. TX flow control: write return codes are checked; commands are sent only on change or
-//     periodic refresh; command-feedback flag dropped (startup byte 0x11 -> 0x10).
+//     periodic refresh; no per-command feedback is requested (startup byte 0x10).
 //  3. Explicit connection parameters: supervision timeout 2 s, slave latency 0.
 //  4. Timeouts for CONNECTING / discovery / CCCD steps -> cancel / disconnect and rescan.
 //  5. Notifications enabled: logs Generic Error, Attached I/O, battery %, low-voltage /
 //     high-current alerts (to diagnose brown-outs).
 //  6. PWM capture: pulses outside [800..2200] us rejected; coalesced rise+fall events dropped
-//     (v1 could produce pulse_us = 0 -> full reverse throttle).
+//     (otherwise pulse_us = 0 could map to full reverse throttle).
 //  7. Hardware watchdog (1 s).
-//  8. Steering: gear ratio + motor-angle soft limit; lower max power to limit stall current.
+//  8. Steering: gear ratio + motor-angle soft limit; reduced max power to limit stall current.
 //  9. GATT selection prefers the exact LEGO Hub characteristic UUID, heuristic as fallback.
 //
 // Build: Pico SDK 2.2.x
@@ -68,7 +68,7 @@
 #define STEER_MOTOR_DEG_LIMIT  240  // TODO: measure the mechanical end-stop, set ~10% below it
 #define STEER_RESEND_DEG       3    // ignore target changes smaller than this (motor deg)
 #define STEER_GOTO_SPEED       80   // 1..100
-#define STEER_GOTO_MAXPOWER    80   // 0..100 (v1 doc used 100 -> high stall current at end-stop)
+#define STEER_GOTO_MAXPOWER    80   // 0..100 (100 draws high stall current at the end-stop)
 #define STEER_ENDSTATE         126  // 126=HOLD, 127=BRAKE, 0=FLOAT
 
 // Output scheduling
@@ -135,7 +135,7 @@ static void pwm_gpio_irq(uint gpio, uint32_t events) {
     bool fall = (events & GPIO_IRQ_EDGE_FALL) != 0;
 
     // Both edges latched in one IRQ = we were too late to know the edge order/timing.
-    // v1 computed dt = 0 here -> pulse_us = 0 -> mapped to full reverse. Drop it.
+    // Computing dt here would give 0 -> pulse_us = 0 -> full reverse. Drop it.
     if (rise && fall) {
         ch->rise_valid = false;
         return;
@@ -329,7 +329,7 @@ static uint32_t tx_ok = 0, tx_drop = 0;
 static int      last_battery_pct = -1;
 
 // Buffer for write-with-response: BTstack keeps the pointer until the write completes,
-// so it must not live on the stack (v1 passed a stack buffer).
+// so it must not live on the stack.
 static uint8_t wr_resp_buf[20];
 
 static void gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -539,7 +539,7 @@ static void gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
                 break;
             }
 
-            // Heuristic candidates (same as v1)
+            // Heuristic candidates (fallback)
             if (tmp_write_value_handle == 0 && (can_wnr || can_w)) {
                 tmp_write_value_handle = c.value_handle;
                 tmp_write_is_wo_resp = can_wnr;
@@ -850,7 +850,7 @@ int main(void) {
     }
     sleep_ms(200);
 
-    printf("\n=== LEGO DBW Pico W v2 ===\n");
+    printf("\n=== LEGO DBW Pico W v1.0 ===\n");
     if (watchdog_caused_reboot()) printf("[BOOT] *** previous run was reset by WATCHDOG ***\n");
 
     // PWM inputs

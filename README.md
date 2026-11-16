@@ -1,123 +1,136 @@
 # LEGO 42160 Drive-by-Wire Gateway
 
-Turns the **LEGO Technic 42160 Audi RS Q e-tron** into a drive-by-wire platform controlled by **ArduPilot**.
+Biến chiếc **LEGO Technic 42160 Audi RS Q e-tron** thành một nền tảng drive-by-wire điều khiển bằng **ArduPilot**.
 
-A **Raspberry Pi Pico W** reads PWM outputs from an ArduPilot flight controller and drives the LEGO Technic Hub over BLE using the **LEGO Wireless Protocol 3 (LWP3)**. The gateway enforces safety gating, so the car can run under manual RC or a full autonomous stack.
+Một bo **Raspberry Pi Pico W** đọc các tín hiệu PWM từ flight controller chạy ArduPilot, rồi điều khiển LEGO Technic Hub qua BLE bằng giao thức **LEGO Wireless Protocol 3 (LWP3)**. Gateway có lớp an toàn riêng, nên xe chạy được cả bằng tay điều khiển RC lẫn bằng hệ thống tự hành.
+
+**Phiên bản hiện tại: v1.0** (11/2026), phiên bản chính thức đầu tiên, đã chạy thử trên xe.
 
 <p align="center">
-  <img src="docs/media/car-and-transmitter.jpg" alt="LEGO 42160 with the Pico W gateway installed, next to the RC transmitter" width="720">
+  <img src="docs/media/car-and-transmitter.jpg" alt="LEGO 42160 đã lắp Pico W gateway, bên cạnh tay điều khiển RC" width="720">
 </p>
 
 ## Demo
 
-Driving under manual RC through ArduPilot with the v2 firmware:
+Xe chạy bằng tay điều khiển RC thông qua ArduPilot:
 
 <p align="center">
-  <a href="docs/media/demo.mp4"><img src="docs/media/demo.gif" alt="LEGO 42160 driving and steering under RC control" width="480"></a>
+  <a href="docs/media/demo.mp4"><img src="docs/media/demo.gif" alt="LEGO 42160 chạy và đánh lái bằng tay điều khiển RC" width="480"></a>
   <br>
-  <sub>11-second preview. Click it or open <a href="docs/media/demo.mp4"><code>docs/media/demo.mp4</code></a> for the full 30-second clip.</sub>
+  <sub>Đoạn xem trước 11 giây. Bấm vào ảnh hoặc mở <a href="docs/media/demo.mp4"><code>docs/media/demo.mp4</code></a> để xem clip đầy đủ 30 giây.</sub>
 </p>
 
 <p align="center">
-  <img src="docs/media/car.jpg" alt="Close-up of the car with the Pico W mounted in the cabin" width="560">
+  <img src="docs/media/car.jpg" alt="Cận cảnh xe với Pico W gắn trong cabin" width="560">
   <br>
-  <sub>The Pico W gateway mounted in the cabin.</sub>
+  <sub>Pico W gateway gắn trong cabin xe.</sub>
 </p>
 
-## Architecture
+## Kiến trúc
 
 ```
 [Matek F405 Mini / ArduPilot Rover]
-        │ PWM: throttle, steering, enable (deadman)
+        │ PWM: ga (throttle), lái (steering), cho phép chạy (enable)
         ▼
-[Raspberry Pi Pico W]  ── PWM capture · safety gating · BLE central
+[Raspberry Pi Pico W]  ── đọc PWM · lớp an toàn · BLE central
         │ BLE / LWP3
         ▼
 [LEGO Technic Hub]
-   ├─ Port A/B: drive motors      (StartPower)
-   └─ Port D:   steering motor    (GotoAbsolutePosition → servo-like, auto-centering)
+   ├─ Cổng A/B: motor kéo   (StartPower)
+   └─ Cổng D:   motor lái   (GotoAbsolutePosition → hoạt động như servo, tự về giữa)
 ```
 
-## Contents
+## Tính năng chính
 
-1. [Quick start checklist](#1-quick-start-checklist)
-2. [Hardware and wiring](#2-hardware-and-wiring)
-3. [Install the build tools](#3-install-the-build-tools)
-4. [Set your hub's address](#4-set-your-hubs-address)
-5. [Build the firmware](#5-build-the-firmware)
-6. [Upload the firmware to the Pico W](#6-upload-the-firmware-to-the-pico-w)
-7. [Watch the serial log](#7-watch-the-serial-log)
-8. [Configure ArduPilot](#8-configure-ardupilot)
-9. [First run and safety test](#9-first-run-and-safety-test)
-10. [Steering calibration](#10-steering-calibration)
-11. [Configuration reference](#11-configuration-reference)
-12. [Safety behaviour](#12-safety-behaviour)
-13. [Troubleshooting](#13-troubleshooting)
-14. [Repository layout and history](#14-repository-layout-and-history)
+- **Lái kiểu servo, tự về giữa:** motor lái được điều khiển theo góc tuyệt đối, có bù tỉ số truyền (~6:1) và giới hạn góc mềm để không ghì vào điểm chặn cơ khí.
+- **Kết nối BLE ổn định:** vòng điều khiển chạy trong run loop của BTstack, chỉ gửi lệnh khi giá trị thay đổi (kèm làm mới định kỳ 300 ms), supervision timeout 2 s.
+- **Tự phục hồi:** mỗi bước kết nối có timeout 8 s rồi tự quét lại; mất kết nối thì tự kết nối lại; watchdog phần cứng 1 s khởi động lại Pico nếu bị treo.
+- **Lớp an toàn:** dừng xe và trả lái về giữa khi tắt công tắc enable, mất tín hiệu PWM, hoặc xung PWM bất thường.
+- **Chẩn đoán:** log qua USB hiển thị trạng thái mỗi giây, % pin của hub, cảnh báo sụt áp/quá dòng và mã lỗi khi mất kết nối.
+
+## Mục lục
+
+1. [Checklist nhanh](#quick-start)
+2. [Phần cứng và đấu dây](#hardware)
+3. [Cài công cụ build](#tools)
+4. [Đặt địa chỉ MAC của hub](#hub-address)
+5. [Build firmware](#build)
+6. [Nạp firmware vào Pico W](#upload)
+7. [Xem log serial](#serial-log)
+8. [Cấu hình ArduPilot](#ardupilot)
+9. [Chạy lần đầu và kiểm tra an toàn](#first-run)
+10. [Căn chỉnh lái](#steering)
+11. [Bảng tham số](#config)
+12. [Cơ chế an toàn](#safety)
+13. [Xử lý sự cố](#troubleshooting)
+14. [Cấu trúc repo và kế hoạch phát triển](#repo)
 
 ---
 
-## 1. Quick start checklist
+<a id="quick-start"></a>
+## 1. Checklist nhanh
 
-If you have done this before and only need a reminder:
+Dành cho lúc đã làm rồi và chỉ cần nhắc lại:
 
 ```bash
-# one-time: tools + SDK (see section 3)
+# một lần: cài công cụ + SDK (xem mục 3)
 export PICO_SDK_PATH=~/pico/pico-sdk
 
 # build
 cmake -S . -B build
 cmake --build build -j
 
-# upload: hold BOOTSEL, plug in USB, copy the file to the RPI-RP2 drive
+# nạp: giữ BOOTSEL, cắm USB, chép file vào ổ RPI-RP2
 cp build/lego_dbw.uf2 /media/$USER/RPI-RP2/      # Linux
-# or: picotool load -fx build/lego_dbw.uf2
+# hoặc: picotool load -fx build/lego_dbw.uf2
 
-# serial log
-screen /dev/ttyACM0 115200                        # Ctrl-A then K to quit
+# xem log serial
+screen /dev/ttyACM0 115200                        # thoát: Ctrl-A rồi K
 ```
 
-Then: hub on → Pico on → wait for `[BLE] READY` → flip the enable switch → drive.
+Sau đó: bật hub → bật Pico → đợi `[BLE] READY` → gạt công tắc enable → chạy.
 
 ---
 
-## 2. Hardware and wiring
+<a id="hardware"></a>
+## 2. Phần cứng và đấu dây
 
-| Item | Notes |
+| Thiết bị | Ghi chú |
 |---|---|
-| LEGO 42160 + Technic Hub | Hub powered by its own AA pack |
-| Matek F405 Mini | ArduPilot **Rover** firmware; powered separately |
-| Raspberry Pi Pico W | Powered from USB or a 5 V rail (VSYS) |
-| 3 signal wires + 1 GND wire | **Common ground between Matek and Pico is required** |
-| Micro-USB cable | For uploading firmware and reading the log |
+| LEGO 42160 + Technic Hub | Hub dùng hộp pin AA riêng |
+| Matek F405 Mini | Firmware ArduPilot **Rover**; cấp nguồn riêng |
+| Raspberry Pi Pico W | Cấp nguồn qua USB hoặc đường 5 V (chân VSYS) |
+| 3 dây tín hiệu + 1 dây GND | **Bắt buộc nối chung GND giữa Matek và Pico** |
+| Cáp micro-USB | Để nạp firmware và đọc log |
 
-| Matek output | Signal | Pico pin |
+| Ngõ ra Matek | Tín hiệu | Chân Pico |
 |---|---|---|
-| S1 | Throttle | GP2 (physical pin 4) |
-| S2 | Steering | GP3 (physical pin 5) |
-| S3 | Enable (deadman) | GP4 (physical pin 6) |
-| GND | Ground | any GND pin (e.g. physical pin 3) |
+| S1 | Ga (throttle) | GP2 (chân số 4) |
+| S2 | Lái (steering) | GP3 (chân số 5) |
+| S3 | Cho phép chạy (enable / deadman) | GP4 (chân số 6) |
+| GND | Mass | chân GND bất kỳ (ví dụ chân số 3) |
 
-There is no wired connection to the LEGO hub; the link is BLE only.
+Không có dây nối tới hub LEGO; hub chỉ giao tiếp qua BLE.
 
-> The Pico's inputs are 3.3 V. Standard PWM outputs on F405 boards are 3.3 V, so a direct connection is fine. Do not connect a 5 V signal source.
+> Chân vào của Pico là 3,3 V. Ngõ ra PWM của các bo F405 thông thường là 3,3 V nên nối thẳng được. Không nối nguồn tín hiệu 5 V.
 
 ---
 
-## 3. Install the build tools
+<a id="tools"></a>
+## 3. Cài công cụ build
 
-You need three things: **CMake**, the **ARM GCC cross-compiler**, and the **Pico SDK 2.2.x** (with its submodules). Pick one of the options below.
+Cần ba thứ: **CMake**, **trình biên dịch chéo ARM GCC** và **Pico SDK 2.2.x** (kèm các submodule). Chọn một trong các cách dưới đây.
 
-### Option A: VS Code + Raspberry Pi Pico extension (easiest, all OSes)
+### Cách A: VS Code + extension Raspberry Pi Pico (dễ nhất, mọi hệ điều hành)
 
-1. Install [VS Code](https://code.visualstudio.com/).
-2. Install the extension **"Raspberry Pi Pico"** (publisher: Raspberry Pi).
-3. Open this repository folder in VS Code. When the extension offers to import the project, choose **SDK version 2.2.0** and board **pico_w**.
-4. The extension downloads the SDK, compiler, CMake, Ninja and picotool for you. Use its **Compile Project** and **Run Project** buttons instead of sections 5–6.
+1. Cài [VS Code](https://code.visualstudio.com/).
+2. Cài extension **"Raspberry Pi Pico"** (nhà phát hành: Raspberry Pi).
+3. Mở thư mục repo này trong VS Code. Khi extension đề nghị import project, chọn **SDK 2.2.0** và board **pico_w**.
+4. Extension tự tải SDK, trình biên dịch, CMake, Ninja và picotool. Dùng nút **Compile Project** và **Run Project** thay cho mục 5–6.
 
-If you use this option, skip to [section 4](#4-set-your-hubs-address).
+Nếu chọn cách này, chuyển thẳng tới [mục 4](#hub-address).
 
-### Option B: Command line on Linux (Ubuntu / Debian / WSL2)
+### Cách B: Dòng lệnh trên Linux (Ubuntu / Debian / WSL2)
 
 ```bash
 sudo apt update
@@ -126,116 +139,120 @@ sudo apt install -y git cmake build-essential python3 \
     libusb-1.0-0-dev pkg-config
 ```
 
-### Option B: Command line on macOS
+### Cách B: Dòng lệnh trên macOS
 
 ```bash
 brew install cmake libusb pkg-config
 brew install --cask gcc-arm-embedded
 ```
 
-### Get the Pico SDK (Option B only)
+### Tải Pico SDK (chỉ cho cách B)
 
 ```bash
 mkdir -p ~/pico && cd ~/pico
 git clone -b 2.2.0 https://github.com/raspberrypi/pico-sdk.git
 cd pico-sdk
-git submodule update --init      # pulls btstack, cyw43-driver, tinyusb, lwip, ...
+git submodule update --init      # tải btstack, cyw43-driver, tinyusb, lwip, ...
 ```
 
-Tell CMake where the SDK is. Add this to `~/.bashrc` (or `~/.zshrc` on macOS) so you don't have to repeat it:
+Khai báo đường dẫn SDK cho CMake. Thêm dòng này vào `~/.bashrc` (hoặc `~/.zshrc` trên macOS) để không phải gõ lại:
 
 ```bash
 export PICO_SDK_PATH=~/pico/pico-sdk
 ```
 
-> Missing submodules are the most common build failure. If you see `pico/stdio_usb.h: No such file` or `btstack.h: No such file`, run `git submodule update --init` inside the SDK folder again.
+> Thiếu submodule là lỗi build hay gặp nhất. Nếu thấy `pico/stdio_usb.h: No such file` hoặc `btstack.h: No such file`, chạy lại `git submodule update --init` trong thư mục SDK.
 
 ---
 
-## 4. Set your hub's address
+<a id="hub-address"></a>
+## 4. Đặt địa chỉ MAC của hub
 
-The firmware connects to **one specific hub**, identified by its Bluetooth MAC address. Edit this line near the top of `src/lego_dbw_system.c`:
+Firmware chỉ kết nối tới **một hub cụ thể**, xác định bằng địa chỉ MAC Bluetooth. Sửa dòng này ở đầu file `src/lego_dbw_system.c`:
 
 ```c
 static const bd_addr_t HUB_ADDR = { 0x90, 0x84, 0x2B, 0x7F, 0xD4, 0x40 };   // 90:84:2B:7F:D4:40
 ```
 
-If you are still using the same hub as before, leave it as is. To find the address of a different hub, use either method:
+Nếu vẫn dùng hub cũ thì giữ nguyên. Để tìm địa chỉ của hub khác, dùng một trong hai cách:
 
-- **Phone app:** install **nRF Connect** (Android/iOS), turn the hub on (LED blinking), scan, and look for a device named **"Technic Hub"**. The address is shown under the name.
-- **From the Pico itself:** set `#define DEBUG_PRINT_ADV_REPORTS 1`, build and upload, then read the `[ADV]` lines in the serial log. Set it back to `0` afterwards.
+- **App điện thoại:** cài **nRF Connect** (Android/iOS), bật hub (đèn nhấp nháy), quét và tìm thiết bị tên **"Technic Hub"**. Địa chỉ hiện ngay dưới tên.
+- **Dùng chính Pico:** đặt `#define DEBUG_PRINT_ADV_REPORTS 1`, build và nạp, rồi đọc các dòng `[ADV]` trong log. Xong thì đặt lại `0`.
 
-> **Close the LEGO Control+ / Powered Up app on your phone.** The hub accepts only one connection; if the phone is connected, the Pico can never reach it.
+> **Tắt app LEGO Control+ / Powered Up trên điện thoại.** Hub chỉ nhận một kết nối; nếu điện thoại đang kết nối thì Pico không bao giờ vào được.
 
 ---
 
-## 5. Build the firmware
+<a id="build"></a>
+## 5. Build firmware
 
-From the repository folder:
+Trong thư mục repo:
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-The first build takes several minutes: it also builds `picotool` and `pioasm` from source (this needs internet access and a normal host C/C++ compiler). Later builds take seconds.
+Lần build đầu mất vài phút vì phải build thêm `picotool` và `pioasm` từ mã nguồn (cần mạng và trình biên dịch C/C++ thông thường của máy). Các lần sau chỉ mất vài giây.
 
-The result is **`build/lego_dbw.uf2`**. This is the file you upload.
+Kết quả là file **`build/lego_dbw.uf2`**, đây là file để nạp.
 
-If you change only the `.c` file, re-running `cmake --build build -j` is enough. If you change `CMakeLists.txt`, or the build behaves strangely, delete the `build` folder and run both commands again.
+Nếu chỉ sửa file `.c`, chạy lại `cmake --build build -j` là đủ. Nếu sửa `CMakeLists.txt` hoặc build có hiện tượng lạ, xoá thư mục `build` rồi chạy lại cả hai lệnh.
 
-Build notes:
-- BLE only: the project defines `CYW43_LWIP=0`, so no lwIP/WiFi stack is pulled in.
-- `config/btstack_config.h` enables `ENABLE_LE_PERIPHERAL` in addition to `ENABLE_LE_CENTRAL`. The peripheral role is unused, but BTstack's `hci.c` in SDK 2.2 does not compile without it.
+Ghi chú về build:
+- Chỉ dùng BLE: project định nghĩa `CYW43_LWIP=0` nên không kéo theo stack lwIP/WiFi.
+- `config/btstack_config.h` bật `ENABLE_LE_PERIPHERAL` bên cạnh `ENABLE_LE_CENTRAL`. Vai trò peripheral không được dùng, nhưng file `hci.c` của BTstack trong SDK 2.2 không biên dịch được nếu thiếu nó.
 
 ---
 
-## 6. Upload the firmware to the Pico W
+<a id="upload"></a>
+## 6. Nạp firmware vào Pico W
 
-### Method 1: Drag and drop (always works)
+### Cách 1: Kéo thả (luôn dùng được)
 
-1. **Unplug** the Pico W from USB.
-2. **Hold down the white BOOTSEL button** on the Pico W.
-3. **Plug in** the USB cable while still holding the button. Release after one second.
-4. A USB drive named **`RPI-RP2`** appears on your computer.
-5. **Copy `build/lego_dbw.uf2` onto that drive.**
-6. The drive disappears by itself and the Pico reboots into the new firmware. That is normal, not an error.
+1. **Rút** cáp USB của Pico W.
+2. **Giữ nút BOOTSEL** màu trắng trên Pico W.
+3. **Cắm** cáp USB trong khi vẫn giữ nút. Thả nút sau khoảng một giây.
+4. Máy tính hiện một ổ USB tên **`RPI-RP2`**.
+5. **Chép file `build/lego_dbw.uf2` vào ổ đó.**
+6. Ổ đĩa tự biến mất và Pico khởi động lại với firmware mới. Đây là bình thường, không phải lỗi.
 
-On WSL2, copy the file from Windows Explorer: the build folder is reachable at `\\wsl$\<distro>\home\<user>\...`.
+Trên WSL2, chép file từ Windows Explorer: thư mục build nằm ở `\\wsl$\<distro>\home\<user>\...`.
 
-### Method 2: picotool (no button press after the first upload)
+### Cách 2: picotool (từ lần thứ hai không cần bấm nút)
 
-Once this firmware is running, picotool can reboot the Pico into upload mode over USB by itself:
+Khi firmware này đang chạy, picotool tự chuyển Pico sang chế độ nạp qua USB:
 
 ```bash
 picotool load -fx build/lego_dbw.uf2
-# -f: force the running Pico into BOOTSEL mode, -x: start the program after loading
+# -f: ép Pico đang chạy vào chế độ BOOTSEL, -x: chạy chương trình sau khi nạp
 ```
 
-`picotool` was built during the first build. If it is not on your PATH, find it under `build/_deps/picotool/`. On Linux, use `sudo` or install the udev rules from the picotool repository if you get a permission error.
+`picotool` đã được build trong lần build đầu. Nếu chưa có trong PATH, tìm nó trong `build/_deps/picotool/`. Trên Linux, nếu báo lỗi quyền truy cập thì dùng `sudo` hoặc cài udev rules của picotool.
 
-### Method 3: VS Code extension
+### Cách 3: Extension VS Code
 
-Click **Run Project** in the extension's side panel (Pico must be connected; it uses picotool).
+Bấm **Run Project** trong thanh bên của extension (Pico phải đang cắm; extension dùng picotool).
 
 ---
 
-## 7. Watch the serial log
+<a id="serial-log"></a>
+## 7. Xem log serial
 
-The firmware prints its log over USB as a virtual serial port (any baud rate works; 115200 is conventional).
+Firmware in log qua USB dưới dạng cổng serial ảo (baud rate nào cũng được; thường dùng 115200).
 
-| OS | Port | Command |
+| Hệ điều hành | Cổng | Lệnh |
 |---|---|---|
-| Linux / WSL | `/dev/ttyACM0` | `screen /dev/ttyACM0 115200` (quit: Ctrl-A, then K, then Y) or `minicom -D /dev/ttyACM0` |
+| Linux / WSL | `/dev/ttyACM0` | `screen /dev/ttyACM0 115200` (thoát: Ctrl-A, K, rồi Y) hoặc `minicom -D /dev/ttyACM0` |
 | macOS | `/dev/tty.usbmodem*` | `screen /dev/tty.usbmodem* 115200` |
-| Windows | `COMx` (see Device Manager) | PuTTY (Serial, COMx, 115200), or the **Serial Monitor** extension in VS Code |
+| Windows | `COMx` (xem trong Device Manager) | PuTTY (Serial, COMx, 115200), hoặc extension **Serial Monitor** của VS Code |
 
-After boot the firmware waits up to 5 seconds for a serial monitor before continuing, so open the monitor quickly if you want to see the first lines.
+Sau khi khởi động, firmware đợi tối đa 5 giây cho chương trình đọc serial rồi mới chạy tiếp, nên mở log nhanh nếu muốn xem những dòng đầu tiên.
 
-A healthy start looks like this:
+Log khởi động bình thường trông như sau:
 
 ```
-=== LEGO DBW Pico W v2 ===
+=== LEGO DBW Pico W v1.0 ===
 [BLE] scanning...
 [BLE] hub seen rssi=-58 -> connect
 [BLE] connecting to 90:84:2B:7F:D4:40...
@@ -249,165 +266,168 @@ A healthy start looks like this:
 [DBG] ble=1 st=6 | thr=1500 str=1500 en=1900 | armed=1 | thr_cmd=0 steer=0mdeg | tx ok=12 drop=0
 ```
 
-The exact numbers (handles, RSSI, io types) will differ. What matters is reaching `[BLE] READY`, followed by a `[DBG]` line every second.
+Các con số cụ thể (handle, RSSI, io type) sẽ khác. Điều quan trọng là thấy `[BLE] READY`, sau đó mỗi giây có một dòng `[DBG]`.
 
-How to read the `[DBG]` line:
-- `ble=1` means connected and ready.
-- `thr`, `str` and `en` are the measured pulse widths in µs. `(stale)` means no valid signal on that pin.
-- `armed=1` means all three signals are fresh and enable is above 1600 µs.
-- `tx ok` / `drop` count the commands accepted and rejected by the BLE stack.
+Cách đọc dòng `[DBG]`:
+- `ble=1`: đã kết nối và sẵn sàng.
+- `thr`, `str`, `en`: độ rộng xung đo được (µs). `(stale)` nghĩa là chân đó không có tín hiệu hợp lệ.
+- `armed=1`: cả ba tín hiệu đều mới và enable trên 1600 µs.
+- `tx ok` / `drop`: số lệnh được stack BLE nhận / từ chối.
 
 ---
 
-## 8. Configure ArduPilot
+<a id="ardupilot"></a>
+## 8. Cấu hình ArduPilot
 
-The Pico expects three standard **50 Hz PWM** signals with 1000–2000 µs range and a 1500 µs neutral point. In Mission Planner (Config → Full Parameter List), on Rover firmware:
+Pico cần ba tín hiệu **PWM 50 Hz** tiêu chuẩn, dải 1000–2000 µs, điểm giữa 1500 µs. Trong Mission Planner (Config → Full Parameter List), firmware Rover:
 
-| Parameter | Value | Meaning |
+| Tham số | Giá trị | Ý nghĩa |
 |---|---|---|
 | `SERVO1_FUNCTION` | `70` | Throttle → S1 → GP2 |
 | `SERVO2_FUNCTION` | `26` | GroundSteering → S2 → GP3 |
-| `SERVO3_FUNCTION` | `50 + N` | `RCPassThruN`: copies RC input channel N → S3 → GP4 (e.g. `55` = RCPassThru5) |
-| `SERVO_RC_FS_MSK` | `4` (bit for output 3) | **Required.** On RC loss, output 3 goes to neutral instead of holding its last value |
-| `SERVO1..2_MIN / TRIM / MAX` | `1000 / 1500 / 2000` | Matches the Pico's mapping |
+| `SERVO3_FUNCTION` | `50 + N` | `RCPassThruN`: chép nguyên kênh RC số N → S3 → GP4 (ví dụ `55` = RCPassThru5) |
+| `SERVO_RC_FS_MSK` | `4` (bit của ngõ ra 3) | **Bắt buộc.** Khi mất sóng RC, ngõ ra 3 về mức trung tính thay vì giữ giá trị cuối |
+| `SERVO1..2_MIN / TRIM / MAX` | `1000 / 1500 / 2000` | Khớp với cách Pico quy đổi |
 
-Notes:
-- Put the **enable** function on a two-position switch on your transmitter, then use that channel number for `SERVO3_FUNCTION`. Switch high (> 1600 µs) = drive allowed; switch low = stop and centre. This acts as a deadman, independent of ArduPilot's arming state.
-- **Why `SERVO_RC_FS_MSK` matters:** a passthrough output normally keeps its last valid value when the RC link is lost. Without the mask, switching the transmitter off while the enable switch is high would leave the car armed. Test it: with enable high, turn the transmitter off and check that `en` in the `[DBG]` line drops below 1600 µs and `armed` goes to 0.
-- Passthrough outputs copy the input pulse exactly; their `SERVO3_MIN/TRIM/MAX` have no effect.
-- The outputs must be plain PWM, not DShot or OneShot.
-- If outputs stay silent, check that the vehicle is armed and that the board safety switch is not blocking outputs (`BRD_SAFETY_DEFLT`).
-- Verify the parameter values against the parameter list of your ArduPilot version.
+Ghi chú:
+- Gán **enable** cho một công tắc hai vị trí trên tay điều khiển, rồi dùng số kênh đó cho `SERVO3_FUNCTION`. Công tắc lên (> 1600 µs) = cho phép chạy; công tắc xuống = dừng và trả lái về giữa. Đây là công tắc deadman, độc lập với trạng thái arm của ArduPilot.
+- **Vì sao cần `SERVO_RC_FS_MSK`:** ngõ ra passthrough mặc định giữ giá trị hợp lệ cuối cùng khi mất sóng RC. Thiếu tham số này, nếu tắt tay điều khiển lúc công tắc enable đang bật thì xe vẫn ở trạng thái cho phép chạy. Cách kiểm tra: bật enable, tắt tay điều khiển, xem `en` trong dòng `[DBG]` có xuống dưới 1600 µs và `armed` về 0 không.
+- Ngõ ra passthrough chép nguyên xung đầu vào; các tham số `SERVO3_MIN/TRIM/MAX` không có tác dụng.
+- Ngõ ra phải là PWM thường, không phải DShot hay OneShot.
+- Nếu ngõ ra không có tín hiệu, kiểm tra xe đã arm chưa và nút safety trên bo có đang chặn ngõ ra không (`BRD_SAFETY_DEFLT`).
+- Đối chiếu giá trị tham số với danh sách tham số của phiên bản ArduPilot đang dùng.
 
 ---
 
-## 9. First run and safety test
+<a id="first-run"></a>
+## 9. Chạy lần đầu và kiểm tra an toàn
 
-**Put the car on a stand with the wheels off the ground** for the first run after any firmware change.
+**Kê xe lên giá cho bánh không chạm đất** trong lần chạy đầu tiên sau mỗi lần thay firmware.
 
-1. **Centre the front wheels by hand**, then turn on the Technic Hub (see [section 10](#10-steering-calibration) for why). The hub LED blinks.
-2. Power the flight controller and the Pico W. Open the serial log.
-3. Wait for `[BLE] READY`. The hub LED changes from blinking to steady once the Pico connects.
-4. Check that the `[DBG]` line shows sensible pulse widths for all three channels.
-5. Flip the enable switch high → `armed=1`.
-6. Test steering with small stick movements first, then throttle.
+1. **Chỉnh bánh trước về giữa bằng tay**, rồi bật Technic Hub (lý do xem [mục 10](#steering)). Đèn hub nhấp nháy.
+2. Cấp nguồn cho flight controller và Pico W. Mở log serial.
+3. Đợi `[BLE] READY`. Đèn hub chuyển từ nhấp nháy sang sáng đứng khi Pico đã kết nối.
+4. Kiểm tra dòng `[DBG]` có độ rộng xung hợp lý ở cả ba kênh.
+5. Arm ArduPilot (chế độ Manual), gạt công tắc enable lên → `armed=1`.
+6. Thử lái trước với biên độ nhỏ, sau đó mới thử ga.
 
-Then run these checks once:
+Sau đó chạy các bài kiểm tra sau một lần:
 
-| Test | Expected result |
+| Bài kiểm tra | Kết quả mong đợi |
 |---|---|
-| Flip the enable switch low while driving | Motors stop, steering returns to centre |
-| Turn the RC transmitter off with enable high | `armed=0`: motors stop, steering centres (needs `SERVO_RC_FS_MSK`, section 8) |
-| Unplug the S1 throttle wire | Within 250 ms: motors stop, steering centres |
-| **Hold throttle, then unplug the Pico's power** | **Verify the hub stops the motors by itself.** The Pico cannot send a stop once the BLE link is gone. If the car keeps driving, treat this as a known hazard |
-| Turn the hub off and on again | Log shows a disconnect, then `scanning`, then `READY` again without touching the Pico |
+| Gạt công tắc enable xuống khi đang chạy | Motor dừng, lái về giữa |
+| Tắt tay điều khiển khi enable đang bật | `armed=0`: motor dừng, lái về giữa (cần `SERVO_RC_FS_MSK`, mục 8) |
+| Rút dây ga S1 | Trong vòng 250 ms: motor dừng, lái về giữa |
+| **Giữ ga rồi rút nguồn Pico** | **Xác nhận hub tự dừng motor.** Khi mất kết nối BLE, Pico không gửi được lệnh dừng. Nếu xe vẫn chạy, coi đây là rủi ro đã biết |
+| Tắt hub rồi bật lại | Log báo mất kết nối, rồi `scanning`, rồi `READY` mà không cần đụng vào Pico |
 
 ---
 
-## 10. Steering calibration
+<a id="steering"></a>
+## 10. Căn chỉnh lái
 
-**Centre position.** `GotoAbsolutePosition` measures angles from wherever the steering motor was **when the hub was switched on**. If the wheels were turned at power-on, "centre" will be off. Always centre the wheels by hand before switching the hub on. (A proper calibration routine is on the roadmap.)
+**Vị trí giữa.** `GotoAbsolutePosition` tính góc từ vị trí của motor lái **tại thời điểm bật hub**. Nếu lúc bật hub bánh đang lệch thì "vị trí giữa" cũng lệch theo. Luôn chỉnh bánh về giữa bằng tay trước khi bật hub. (Routine tự căn chỉnh nằm trong kế hoạch phát triển.)
 
-**End-stop limit.** Driving the steering motor into the mechanical stop at high power draws a lot of current, which can make the hub's voltage dip and reset it. To find a safe limit:
+**Giới hạn góc lái.** Ép motor lái vào điểm chặn cơ khí ở công suất cao sẽ kéo dòng lớn, có thể làm sụt áp và khiến hub khởi động lại. Cách tìm giới hạn an toàn:
 
-1. Set `STEER_MOTOR_DEG_LIMIT` to a low value, for example `120`. Build and upload.
-2. Push the steering stick fully to one side and watch whether the wheels reach full lock.
-3. Raise the limit in steps of about 20° until they just reach full lock without the motor straining or buzzing.
-4. Set the final value about 10% below that point.
+1. Đặt `STEER_MOTOR_DEG_LIMIT` ở mức thấp, ví dụ `120`. Build và nạp.
+2. Đẩy cần lái hết về một phía, xem bánh có đánh hết lái không.
+3. Tăng giới hạn mỗi lần khoảng 20° cho đến khi bánh vừa đánh hết lái mà motor không gồng hay kêu rè.
+4. Đặt giá trị cuối cùng thấp hơn điểm đó khoảng 10%.
 
-`STEER_GEAR_RATIO` (6) converts wheel degrees to motor degrees; `STEER_TARGET_DEG_MAX` (40) is the wheel angle requested at full stick before the limit is applied.
+`STEER_GEAR_RATIO` (6) đổi góc bánh sang góc motor; `STEER_TARGET_DEG_MAX` (40) là góc bánh yêu cầu khi đẩy hết cần lái, trước khi áp giới hạn.
 
 ---
 
-## 11. Configuration reference
+<a id="config"></a>
+## 11. Bảng tham số
 
-All tunables are at the top of `src/lego_dbw_system.c`. Rebuild and re-upload after changing any of them.
+Mọi tham số nằm ở đầu file `src/lego_dbw_system.c`. Sau khi sửa phải build và nạp lại.
 
-| Setting | Default | Meaning |
+| Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
-| `HUB_ADDR` | `90:84:2B:7F:D4:40` | MAC of **your** Technic Hub |
-| `GPIO_PWM_THROTTLE / STEERING / ENABLE` | 2 / 3 / 4 | Input pins |
-| `ENABLE_THRESHOLD_US` | 1600 | Enable channel must be above this to arm |
-| `PWM_TIMEOUT_MS` | 250 | Signal age before a channel counts as lost |
-| `PWM_DEADBAND_US` | 30 | Dead zone around 1500 µs |
-| `THROTTLE_MAX_POWER` | 100 | Maximum drive power (0–100) |
-| `STEER_TARGET_DEG_MAX` | 40 | Wheel-side angle at full stick |
-| `STEER_GEAR_RATIO` | 6 | Motor degrees per wheel degree (measured ~6:1) |
-| `STEER_MOTOR_DEG_LIMIT` | 240 | **Measure your end-stop, see section 10** |
-| `STEER_GOTO_SPEED` | 80 | Steering speed (1–100) |
-| `STEER_GOTO_MAXPOWER` | 80 | Lower = less stall current at the end-stop |
-| `CONN_SUPERVISION_TO` | 200 (2 s) | BLE link supervision timeout |
-| `DEBUG_PRINT_ADV_REPORTS` | 0 | Set to 1 to list every BLE device seen while scanning |
+| `HUB_ADDR` | `90:84:2B:7F:D4:40` | Địa chỉ MAC của Technic Hub **của bạn** |
+| `GPIO_PWM_THROTTLE / STEERING / ENABLE` | 2 / 3 / 4 | Các chân đầu vào |
+| `ENABLE_THRESHOLD_US` | 1600 | Kênh enable phải trên ngưỡng này mới cho phép chạy |
+| `PWM_TIMEOUT_MS` | 250 | Quá thời gian này không có xung mới thì coi như mất tín hiệu |
+| `PWM_DEADBAND_US` | 30 | Vùng chết quanh 1500 µs |
+| `THROTTLE_MAX_POWER` | 100 | Công suất kéo tối đa (0–100) |
+| `STEER_TARGET_DEG_MAX` | 40 | Góc bánh khi đẩy hết cần lái |
+| `STEER_GEAR_RATIO` | 6 | Số độ motor cho mỗi độ bánh (đo được ~6:1) |
+| `STEER_MOTOR_DEG_LIMIT` | 240 | **Cần đo theo xe, xem mục 10** |
+| `STEER_GOTO_SPEED` | 80 | Tốc độ đánh lái (1–100) |
+| `STEER_GOTO_MAXPOWER` | 80 | Càng thấp càng ít dòng khi chạm điểm chặn |
+| `CONN_SUPERVISION_TO` | 200 (2 s) | Supervision timeout của kết nối BLE |
+| `DEBUG_PRINT_ADV_REPORTS` | 0 | Đặt 1 để liệt kê mọi thiết bị BLE quét được |
 
 ---
 
-## 12. Safety behaviour
+<a id="safety"></a>
+## 12. Cơ chế an toàn
 
-The gateway commands **throttle 0 and steering centre** whenever any of these is true:
-- the enable PWM is below threshold or stale,
-- the throttle or steering PWM is stale (> 250 ms),
-- a pulse is outside 800–2200 µs (rejected as noise).
+Gateway ra lệnh **ga = 0 và lái về giữa** khi có bất kỳ điều kiện nào sau:
+- kênh enable dưới ngưỡng hoặc mất tín hiệu,
+- kênh ga hoặc lái mất tín hiệu (> 250 ms),
+- xung nằm ngoài khoảng 800–2200 µs (bị loại như nhiễu).
 
-When the BLE link is down, the gateway cannot send anything. Behaviour then depends on the hub firmware (see the safety test in [section 9](#9-first-run-and-safety-test)).
+Khi mất kết nối BLE, gateway không gửi được lệnh nào. Lúc đó hành vi của xe phụ thuộc vào firmware của hub (xem bài kiểm tra ở [mục 9](#first-run)).
 
-A 1 s hardware watchdog reboots the Pico if its run loop stalls; the boot log reports watchdog resets.
+Watchdog phần cứng 1 s khởi động lại Pico nếu vòng lặp bị treo; log lúc khởi động sẽ báo nếu lần trước bị watchdog reset.
 
 ---
 
-## 13. Troubleshooting
+<a id="troubleshooting"></a>
+## 13. Xử lý sự cố
 
-### Upload and build
+### Build và nạp
 
-| Symptom | Fix |
+| Hiện tượng | Cách xử lý |
 |---|---|
-| No `RPI-RP2` drive appears | Hold BOOTSEL *before* plugging in. Try another cable: many micro-USB cables are charge-only |
-| `pico/stdio_usb.h` / `btstack.h` not found | SDK submodules missing: run `git submodule update --init` in the SDK folder |
-| `PICO_SDK_PATH` not set | `export PICO_SDK_PATH=~/pico/pico-sdk`, then delete `build/` and run CMake again |
-| No serial port after upload | Wait a few seconds; check Device Manager / `ls /dev/ttyACM*`. If still nothing, the firmware may have crashed: re-upload with BOOTSEL |
-| `picotool` permission denied (Linux) | Use `sudo`, or install picotool's udev rules |
+| Không thấy ổ `RPI-RP2` | Giữ BOOTSEL *trước khi* cắm cáp. Thử cáp khác: nhiều cáp micro-USB chỉ sạc, không truyền dữ liệu |
+| Không tìm thấy `pico/stdio_usb.h` / `btstack.h` | Thiếu submodule SDK: chạy `git submodule update --init` trong thư mục SDK |
+| Chưa đặt `PICO_SDK_PATH` | `export PICO_SDK_PATH=~/pico/pico-sdk`, xoá `build/` rồi chạy lại CMake |
+| Không thấy cổng serial sau khi nạp | Đợi vài giây; kiểm tra Device Manager / `ls /dev/ttyACM*`. Nếu vẫn không có, firmware có thể bị treo: nạp lại bằng BOOTSEL |
+| `picotool` báo lỗi quyền (Linux) | Dùng `sudo`, hoặc cài udev rules của picotool |
 
-### Connection
+### Kết nối
 
-| Symptom | Likely cause |
+| Hiện tượng | Nguyên nhân thường gặp |
 |---|---|
-| Stuck at `[BLE] scanning...` | Hub is off, `HUB_ADDR` is wrong, or the LEGO app on a phone is connected to the hub |
-| `setup timeout` repeated | Weak signal or hub busy; move the Pico closer, restart the hub once |
-| `[DBG]` shows `(stale)` on a channel | Wire not connected, **no common ground**, or ArduPilot output not configured/armed |
-| `armed=0` with all channels fresh | Enable switch is low (≤ 1600 µs) |
-| Steering not centred | Wheels were not centred when the hub was switched on (section 10) |
+| Kẹt ở `[BLE] scanning...` | Hub chưa bật, `HUB_ADDR` sai, hoặc app LEGO trên điện thoại đang kết nối với hub |
+| `setup timeout` lặp lại | Sóng yếu hoặc hub bận; đặt Pico gần hub hơn, khởi động lại hub một lần |
+| `[DBG]` báo `(stale)` ở một kênh | Dây chưa nối, **chưa nối chung GND**, hoặc ngõ ra ArduPilot chưa cấu hình / chưa arm |
+| `armed=0` dù cả ba kênh đều có tín hiệu | Công tắc enable đang ở vị trí thấp (≤ 1600 µs) |
+| Lái không về đúng giữa | Lúc bật hub bánh chưa ở giữa (mục 10) |
 
-### Disconnect reason codes
+### Mã lỗi khi mất kết nối
 
-When the link drops, the log prints a reason code:
+Khi mất kết nối, log in ra mã lý do:
 
-| Reason | Meaning | Where to look |
+| Mã | Ý nghĩa | Cần kiểm tra |
 |---|---|---|
-| `0x08` | Connection timeout | RF, or the hub reset: check for `LOW VOLTAGE` / `HIGH CURRENT` alerts just before. Try fresh batteries and a lower steering limit |
-| `0x13` | Remote user terminated | Hub closed the link (error, battery, button pressed) |
-| `0x3E` | Failed to establish | Connection attempt failed; it retries automatically |
-| `[BOOT] ... WATCHDOG` | Pico was hung | Report it with the log |
+| `0x08` | Connection timeout | Sóng RF, hoặc hub bị khởi động lại: xem ngay trước đó có cảnh báo `LOW VOLTAGE` / `HIGH CURRENT` không. Thử pin mới và giảm giới hạn góc lái |
+| `0x13` | Remote user terminated | Hub chủ động ngắt (lỗi, pin yếu, bấm nút) |
+| `0x3E` | Failed to establish | Kết nối không thành công; firmware tự thử lại |
+| `[BOOT] ... WATCHDOG` | Pico đã bị treo | Lưu lại log để phân tích |
 
-A steadily rising `drop` counter means commands are produced faster than the link accepts them.
+Bộ đếm `drop` tăng đều nghĩa là lệnh được tạo ra nhanh hơn tốc độ đường truyền chấp nhận.
 
 ---
 
-## 14. Repository layout and history
+<a id="repo"></a>
+## 14. Cấu trúc repo và kế hoạch phát triển
 
 ```
-├── src/lego_dbw_system.c     firmware (single file)
-├── config/btstack_config.h   BTstack options
-├── CMakeLists.txt            build definition
-├── pico_sdk_import.cmake     standard SDK locator
-├── docs/review-v1.md         analysis of v1 problems (Vietnamese)
-└── docs/media/               photos and demo video
+├── src/lego_dbw_system.c     firmware (một file duy nhất)
+├── config/btstack_config.h   cấu hình BTstack
+├── CMakeLists.txt            định nghĩa build
+├── pico_sdk_import.cmake     script tìm Pico SDK (chuẩn của Raspberry Pi)
+└── docs/media/               ảnh và video demo
 ```
 
-- **v1**: first working version (commit `3a9c55f`).
-- **v2**: stability rework. The control loop moved out of IRQ context, TX flow control and connection parameters were added, setup timeouts and a watchdog were introduced, and a PWM glitch that could command full reverse was fixed. See [`docs/review-v1.md`](docs/review-v1.md). Tested on the car in November 2026: drives and steers under RC (see [Demo](#demo)).
+### Kế hoạch phát triển
 
-### Roadmap
-
-- Steering calibration routine (find both end-stops, set centre)
-- PIO-based PWM capture
-- Speed-dependent steering gain, closed-loop speed control
-- Telemetry back to ArduPilot
+- Routine tự căn chỉnh lái (tìm hai điểm chặn, tính vị trí giữa)
+- Đọc PWM bằng PIO
+- Hệ số lái theo tốc độ, điều khiển tốc độ vòng kín
+- Gửi telemetry về ArduPilot
