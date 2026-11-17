@@ -11,19 +11,36 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Feature stage, see src/config.h and docs/test-plan.md:  cmake -S . -B build -DDBW_STAGE=3
+set(DBW_STAGE 1 CACHE STRING "Feature stage 0..7")
+message(STATUS "LEGO DBW feature stage: ${DBW_STAGE}")
+
 add_executable(lego_dbw
     src/lego_dbw_system.c
+    src/lwp3.c
+    src/steering.c
+    src/drive.c
+    src/supervisor.c
+    src/mavlink_lite.c
+    src/telemetry.c
+    src/pwm_capture.c
 )
+
+pico_generate_pio_header(lego_dbw ${CMAKE_CURRENT_LIST_DIR}/src/pwm_capture.pio)
 
 # btstack_config.h lives in config/
 target_include_directories(lego_dbw PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/config
+    ${CMAKE_CURRENT_LIST_DIR}/src
 )
 
 target_compile_options(lego_dbw PRIVATE -Wall)
 
 # BLE only: no WiFi / lwIP stack
-target_compile_definitions(lego_dbw PRIVATE CYW43_LWIP=0)
+target_compile_definitions(lego_dbw PRIVATE
+    CYW43_LWIP=0
+    DBW_STAGE=${DBW_STAGE}
+)
 
 target_link_libraries(lego_dbw
     pico_stdlib
@@ -31,6 +48,9 @@ target_link_libraries(lego_dbw
     hardware_timer
     hardware_watchdog
     hardware_sync
+    hardware_pio
+    hardware_clocks
+    hardware_uart
     pico_btstack_ble
     pico_btstack_cyw43
     pico_cyw43_arch_poll

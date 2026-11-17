@@ -4,7 +4,9 @@ Turns the **LEGO Technic 42160 Audi RS Q e-tron** into a drive-by-wire platform 
 
 A **Raspberry Pi Pico W** reads PWM outputs from an ArduPilot flight controller and drives the LEGO Technic Hub over BLE using the **LEGO Wireless Protocol 3 (LWP3)**. The gateway enforces safety gating, so the car can run under manual RC or a full autonomous stack.
 
-**Current version: v1.0** (November 2026), the first official release, tested on the car.
+**Current release: v1.0** (November 2026), tested on the car, on the `main` branch.
+
+> **This is the `v1.1-dev` branch.** It adds automatic steering calibration, curvature-linear steering, speed-dependent steering gain, closed-loop drive speed, PIO-based PWM capture and MAVLink telemetry. These features are implemented and unit-tested but **not yet validated on the car**. They are enabled in stages; follow [`docs/test-plan.md`](docs/test-plan.md) to test them one at a time.
 
 <p align="center">
   <img src="docs/media/car-and-transmitter.jpg" alt="LEGO 42160 with the Pico W gateway installed, next to the RC transmitter" width="720">
@@ -47,6 +49,37 @@ Driving under manual RC through ArduPilot:
 - **Self-recovery:** every connection step has an 8 s timeout and rescans on failure; a dropped link reconnects automatically; a 1 s hardware watchdog reboots the Pico if it hangs.
 - **Safety gating:** stops the car and centres the steering when the enable switch is off, a PWM signal is lost, or a pulse is out of range.
 - **Diagnostics:** a USB serial log with a status line every second, hub battery level, low-voltage/high-current alerts, and decoded disconnect reasons.
+
+New in v1.1-dev (stage in brackets, see [Feature stages](#feature-stages)):
+
+- **PIO PWM capture** [1]: pulse widths measured by PIO state machines, independent of CPU interrupt latency.
+- **MAVLink telemetry** [2]: link state, arming, throttle, steering, speed, battery and calibration status sent to ArduPilot, which forwards them to the ground station.
+- **Motor feedback** [3]: measured steering angle and drive speed from the hub's motor encoders.
+- **Automatic steering calibration** [4]: on the first enable, the steering sweeps to both end-stops at low power and centres on the midpoint; the usable range is set to 90 % of the measured span. No more centring the wheels by hand before power-on.
+- **Curvature-linear steering** [5]: the stick commands path curvature (bicycle model), so the turning radius responds evenly along the stick.
+- **Closed-loop drive speed** [6]: throttle sets a speed held by the hub's motor speed controller, with an acceleration ramp.
+- **Speed-dependent steering gain** [7]: less steering authority at high speed.
+
+### Feature stages
+
+Each new feature is switched on by a build-time stage number, so it can be tested on the car one at a time:
+
+| Stage | Adds |
+|---|---|
+| 0 | v1.0 behaviour (rollback build) |
+| 1 | PIO-based PWM capture |
+| 2 | MAVLink telemetry |
+| 3 | Motor position feedback |
+| 4 | Automatic steering calibration and drive interlock |
+| 5 | Curvature-linear steering |
+| 6 | Closed-loop drive speed |
+| 7 | Speed-dependent steering gain (everything on) |
+
+```bash
+cmake -S . -B build -DDBW_STAGE=4      # default: 1
+```
+
+The procedure and pass criteria for each stage are in [`docs/test-plan.md`](docs/test-plan.md).
 
 ## Contents
 
@@ -108,6 +141,7 @@ Then: hub on → Pico on → wait for `[BLE] READY` → flip the enable switch �
 | S2 | Steering | GP3 (physical pin 5) |
 | S3 | Enable (deadman) | GP4 (physical pin 6) |
 | GND | Ground | any GND pin (e.g. physical pin 3) |
+| UART RX (any free) | MAVLink telemetry, stage 2+ (optional) | GP0 (physical pin 1) |
 
 There is no wired connection to the LEGO hub; the link is BLE only.
 
@@ -165,10 +199,10 @@ export PICO_SDK_PATH=~/pico/pico-sdk
 
 ## 4. Set your hub's address
 
-The firmware connects to **one specific hub**, identified by its Bluetooth MAC address. Edit this line near the top of `src/lego_dbw_system.c`:
+The firmware connects to **one specific hub**, identified by its Bluetooth MAC address. Edit this line in `src/config.h`:
 
 ```c
-static const bd_addr_t HUB_ADDR = { 0x90, 0x84, 0x2B, 0x7F, 0xD4, 0x40 };   // 90:84:2B:7F:D4:40
+#define HUB_ADDR_BYTES  { 0x90, 0x84, 0x2B, 0x7F, 0xD4, 0x40 }   // 90:84:2B:7F:D4:40
 ```
 
 If you are using the same hub, leave it as is. To find the address of a different hub, use either method:
@@ -185,7 +219,7 @@ If you are using the same hub, leave it as is. To find the address of a differen
 From the repository folder:
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DDBW_STAGE=1      # feature stage, see "Feature stages" above
 cmake --build build -j
 ```
 
@@ -281,6 +315,7 @@ The Pico expects three standard **50 Hz PWM** signals with 1000–2000 µs range
 | `SERVO3_FUNCTION` | `50 + N` | `RCPassThruN`: copies RC input channel N → S3 → GP4 (e.g. `55` = RCPassThru5) |
 | `SERVO_RC_FS_MSK` | `4` (bit for output 3) | **Required.** On RC loss, output 3 goes to neutral instead of holding its last value |
 | `SERVO1..2_MIN / TRIM / MAX` | `1000 / 1500 / 2000` | Matches the Pico's mapping |
+| `SERIALn_PROTOCOL` / `SERIALn_BAUD` | `2` / `115` | Telemetry (stage 2+): the UART whose RX pad is wired to Pico GP0 |
 
 Notes:
 - Put the **enable** function on a two-position switch on your transmitter, then use that channel number for `SERVO3_FUNCTION`. Switch high (> 1600 µs) = drive allowed; switch low = stop and centre. This acts as a deadman, independent of ArduPilot's arming state.
@@ -317,7 +352,11 @@ Then run these checks once:
 
 ## 10. Steering calibration
 
-**Centre position.** `GotoAbsolutePosition` measures angles from wherever the steering motor was **when the hub was switched on**. If the wheels were turned at power-on, "centre" will be off. Always centre the wheels by hand before switching the hub on. (An automatic calibration routine is on the [roadmap](#15-roadmap).)
+**Automatic (stage 4 and later).** After the hub connects, flip the enable switch on with the throttle at neutral. The steering sweeps to both end-stops at low power and centres on the midpoint (about 5 s); the drive stays locked until it finishes and the throttle is back at neutral. After a hub reconnect, flip enable off and on again to recalibrate. See stage 4 of [`docs/test-plan.md`](docs/test-plan.md).
+
+The manual procedure below applies to stages 0–3, and to the fallback when automatic calibration fails.
+
+**Centre position.** `GotoAbsolutePosition` measures angles from wherever the steering motor was **when the hub was switched on**. If the wheels were turned at power-on, "centre" will be off. Always centre the wheels by hand before switching the hub on.
 
 **End-stop limit.** Driving the steering motor into the mechanical stop at high power draws a lot of current, which can make the hub's voltage dip and reset it. To find a safe limit:
 
@@ -332,7 +371,7 @@ Then run these checks once:
 
 ## 11. Configuration reference
 
-All tunables are at the top of `src/lego_dbw_system.c`. Rebuild and re-upload after changing any of them.
+All tunables are in `src/config.h`, with a comment on each. Rebuild and re-upload after changing any of them. The most important ones:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -344,7 +383,15 @@ All tunables are at the top of `src/lego_dbw_system.c`. Rebuild and re-upload af
 | `THROTTLE_MAX_POWER` | 100 | Maximum drive power (0–100) |
 | `STEER_TARGET_DEG_MAX` | 40 | Wheel-side angle at full stick |
 | `STEER_GEAR_RATIO` | 6 | Motor degrees per wheel degree (measured ~6:1) |
-| `STEER_MOTOR_DEG_LIMIT` | 240 | **Measure your end-stop, see section 10** |
+| `STEER_MOTOR_DEG_LIMIT` | 240 | Uncalibrated limit (stages 0–3, or if auto-calibration fails). **Measure your end-stop, see section 10** |
+| `STEER_CAL_POWER` | 35 | Auto-calibration sweep torque [4]. Raise if calibration reports `range too small` |
+| `STEER_CAL_MARGIN_PCT` | 90 | Usable steering range as % of the measured half-span [4] |
+| `DRIVE_SPEED_MAX_PCT` | 100 | Speed set-point at full throttle [6] |
+| `DRIVE_MAX_POWER` | 100 | Torque limit of the speed controller [6] |
+| `DRIVE_ACCEL_MS` | 300 | Acceleration ramp, 0 = off; stops are never ramped [6] |
+| `STEER_GAIN_MIN_PCT` | 55 | Steering authority at high speed [7] |
+| `STEER_GAIN_FADE_START_DPS` / `_END_DPS` | 300 / 1200 | Speed range of the gain reduction, drive-motor °/s [7] |
+| `TELEM_SYSID` | 1 | Must match ArduPilot's `SYSID_THISMAV` [2] |
 | `STEER_GOTO_SPEED` | 80 | Steering speed (1–100) |
 | `STEER_GOTO_MAXPOWER` | 80 | Lower = less stall current at the end-stop |
 | `CONN_SUPERVISION_TO` | 200 (2 s) | BLE link supervision timeout |
@@ -405,7 +452,17 @@ A steadily rising `drop` counter means commands are produced faster than the lin
 ## 14. Repository layout
 
 ```
-├── src/lego_dbw_system.c     firmware (single file)
+├── src/lego_dbw_system.c     main: BLE link, control loop
+├── src/config.h              all settings and the feature stage
+├── src/lwp3.[ch]             LEGO Wireless Protocol 3 messages
+├── src/steering.[ch]         steering mapping and auto-calibration
+├── src/supervisor.[ch]       arming, calibration sequencing, drive interlock
+├── src/drive.[ch]            drive speed estimation
+├── src/pwm_capture.*         PIO pulse-width capture
+├── src/telemetry.[ch]        MAVLink telemetry over UART
+├── src/mavlink_lite.[ch]     minimal MAVLink 2 encoder
+├── tests/                    host unit tests (run tests/run_tests.sh)
+├── docs/test-plan.md         staged on-car test plan for v1.1
 ├── config/btstack_config.h   BTstack options
 ├── CMakeLists.txt            build definition
 ├── pico_sdk_import.cmake     standard SDK locator
@@ -416,18 +473,20 @@ A steadily rising `drop` counter means commands are produced faster than the lin
 
 ## 15. Roadmap
 
+Items marked *v1.1-dev* are implemented on this branch and waiting for on-car validation.
+
 ### Steering
 - [x] Steering soft limits (`STEER_MOTOR_DEG_LIMIT`, done in v1.0)
-- [ ] Automatic steering calibration: find both end-stops and set the centre, instead of centring the wheels by hand before power-on
-- [ ] Ackermann steering compensation
-- [ ] Speed-dependent steering gain
+- [ ] Automatic steering calibration: find both end-stops and set the centre, instead of centring the wheels by hand before power-on (*v1.1-dev*)
+- [ ] Ackermann steering compensation: curvature-linear mapping (*v1.1-dev*). The inner/outer wheel geometry itself is set by the mechanical linkage.
+- [ ] Speed-dependent steering gain (*v1.1-dev*)
 
 ### Drive
-- [ ] Closed-loop speed control
+- [ ] Closed-loop speed control (*v1.1-dev*)
 
 ### Gateway
-- [ ] PIO-based PWM capture
-- [ ] Telemetry feedback to ArduPilot
+- [ ] PIO-based PWM capture (*v1.1-dev*)
+- [ ] Telemetry feedback to ArduPilot (*v1.1-dev*)
 
 ### Autonomy
 - [ ] Autonomous navigation stack

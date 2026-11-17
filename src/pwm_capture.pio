@@ -1,0 +1,18 @@
+; pwm_capture.pio — measures the high time of an RC PWM pulse.
+;
+; One state machine per input pin. The SM clock is set to 2 MHz; the counting loop takes
+; 2 cycles per iteration, so the pushed value is the pulse width in microseconds.
+; IN pin base and JMP pin are both the measured GPIO.
+
+.program pwm_capture
+.wrap_target
+    mov x, ~null        ; x = 0xFFFFFFFF
+    wait 0 pin 0        ; make sure we start from a low level
+    wait 1 pin 0        ; rising edge
+high:
+    jmp x-- count       ; x-- (never reaches 0 for real pulses)
+count:
+    jmp pin high        ; loop while the pin is high
+    mov isr, ~x         ; number of iterations = pulse width in us
+    push noblock        ; drop the sample if the CPU has not drained the FIFO
+.wrap

@@ -1,5 +1,5 @@
 // lego_dbw_system.c
-// Pico W PWM -> BLE LEGO Technic Hub (LWP3) Drive-by-Wire Gateway — v1.0
+// Pico W PWM -> BLE LEGO Technic Hub (LWP3) Drive-by-Wire Gateway
 //
 // Design notes:
 //  1. The control loop runs as a BTstack run-loop timer (same context as BTstack), never from
@@ -8,18 +8,16 @@
 //     periodic refresh; no per-command feedback is requested (startup byte 0x10).
 //  3. Explicit connection parameters: supervision timeout 2 s, slave latency 0.
 //  4. Timeouts for CONNECTING / discovery / CCCD steps -> cancel / disconnect and rescan.
-//  5. Notifications enabled: logs Generic Error, Attached I/O, battery %, low-voltage /
-//     high-current alerts (to diagnose brown-outs).
-//  6. PWM capture: pulses outside [800..2200] us rejected; coalesced rise+fall events dropped
-//     (otherwise pulse_us = 0 could map to full reverse throttle).
+//  5. Notifications: Generic Error, Attached I/O, battery %, low-voltage / high-current alerts,
+//     and (FEAT_MOTOR_FEEDBACK) steering position and drive-motor position.
+//  6. PWM capture: PIO state machines (FEAT_PIO_CAPTURE) or GPIO IRQ timestamps; pulses outside
+//     [800..2200] us are rejected.
 //  7. Hardware watchdog (1 s).
-//  8. Steering: gear ratio + motor-angle soft limit; reduced max power to limit stall current.
+//  8. Steering: mapping and automatic end-stop calibration in steering.c.
 //  9. GATT selection prefers the exact LEGO Hub characteristic UUID, heuristic as fallback.
 //
-// Build: Pico SDK 2.2.x
-// Link libs: pico_stdlib hardware_gpio hardware_timer hardware_watchdog
-//            pico_btstack_ble pico_btstack_cyw43 pico_cyw43_arch_poll
-// Requires btstack_config.h with ENABLE_LE_CENTRAL and MAX_NR_GATT_CLIENTS >= 1.
+// All settings and the feature stage are in config.h.
+// Build: Pico SDK 2.2.x (see CMakeLists.txt).
 
 #include <stdio.h>
 #include <string.h>
@@ -34,60 +32,25 @@
 #include "pico/cyw43_arch.h"
 #include "btstack.h"
 
-// ============================================================
-// USER CONFIG
-// ============================================================
+#include "config.h"
+#include "lwp3.h"
+#include "steering.h"
+#include "drive.h"
+#include "supervisor.h"
+#if FEAT_PIO_CAPTURE
+#include "pwm_capture.h"
+#endif
+#if FEAT_TELEMETRY
+#include "telemetry.h"
+#endif
 
-// PWM GPIOs (Matek -> Pico)
-#define GPIO_PWM_THROTTLE   2
-#define GPIO_PWM_STEERING   3
-#define GPIO_PWM_ENABLE     4
+#if FEAT_TELEMETRY
+#define TELEM_EVENT(sev, text) telem_event((sev), (text))
+#else
+#define TELEM_EVENT(sev, text) do { (void)(sev); (void)(text); } while (0)
+#endif
 
-// PWM range / mapping
-#define PWM_MIN_US          1000
-#define PWM_MAX_US          2000
-#define PWM_NEUTRAL_US      1500
-#define PWM_DEADBAND_US     30
-#define PWM_VALID_MIN_US    800     // pulses outside this window are treated as garbage
-#define PWM_VALID_MAX_US    2200
-
-// Safety
-#define PWM_TIMEOUT_MS      250
-#define ENABLE_THRESHOLD_US 1600
-
-// Control loop
-#define CONTROL_HZ          25
-#define CONTROL_PERIOD_MS   (1000 / CONTROL_HZ)
-
-// Drive
-#define THROTTLE_MAX_POWER  100     // [-100..100]
-
-// Steering "servo" (GotoAbsolutePosition)
-#define STEER_TARGET_DEG_MAX   40   // wheel-side degrees at full stick
-#define STEER_GEAR_RATIO       6    // motor deg per wheel deg (measured ~6:1)
-#define STEER_MOTOR_DEG_LIMIT  240  // TODO: measure the mechanical end-stop, set ~10% below it
-#define STEER_RESEND_DEG       3    // ignore target changes smaller than this (motor deg)
-#define STEER_GOTO_SPEED       80   // 1..100
-#define STEER_GOTO_MAXPOWER    80   // 0..100 (100 draws high stall current at the end-stop)
-#define STEER_ENDSTATE         126  // 126=HOLD, 127=BRAKE, 0=FLOAT
-
-// Output scheduling
-#define OUTPUT_REFRESH_MS      300  // resend unchanged commands at this period (keep-alive)
-
-// BLE
-#define BLE_SETUP_TIMEOUT_MS   8000 // max time in CONNECTING / discovery / CCCD before abort
-#define SCAN_INTERVAL          0x0060
-#define SCAN_WINDOW            0x0030
-#define CONN_INTERVAL_MIN      12   // x1.25 ms = 15 ms
-#define CONN_INTERVAL_MAX      24   // x1.25 ms = 30 ms
-#define CONN_LATENCY           0
-#define CONN_SUPERVISION_TO    200  // x10 ms = 2 s (BTstack default is ~720 ms)
-
-// Watchdog
-#define WATCHDOG_TIMEOUT_MS    1000
-
-// Hub address
-static const bd_addr_t HUB_ADDR = { 0x90, 0x84, 0x2B, 0x7F, 0xD4, 0x40 };
+static const bd_addr_t HUB_ADDR = HUB_ADDR_BYTES;
 static const bd_addr_type_t HUB_ADDR_TYPE = BD_ADDR_TYPE_LE_PUBLIC;
 
 // LEGO Hub characteristic 00001624-1212-EFDE-1623-785FEABCD123 (BTstack big-endian order)
@@ -96,18 +59,8 @@ static const uint8_t LEGO_HUB_CHAR_UUID128[16] = {
     0x16, 0x23, 0x78, 0x5F, 0xEA, 0xBC, 0xD1, 0x23
 };
 
-// LEGO port IDs
-#define LEGO_PORT_A  0x00
-#define LEGO_PORT_B  0x01
-#define LEGO_PORT_D  0x03
-
-// LWP3 startup/completion byte: execute immediately, no command feedback
-#define LWP3_STARTUP_IMMEDIATE  0x10
-
-#define DEBUG_PRINT_ADV_REPORTS  0
-
 // ============================================================
-// PWM CAPTURE (IRQ side does only timestamping)
+// PWM CAPTURE
 // ============================================================
 
 typedef struct {
@@ -121,7 +74,13 @@ typedef struct {
 static pwm_chan_t pwm_thr = {0};
 static pwm_chan_t pwm_str = {0};
 static pwm_chan_t pwm_en  = {0};
+static bool pio_capture_active = false;
 
+static inline bool pulse_valid(uint32_t us) {
+    return us >= PWM_VALID_MIN_US && us <= PWM_VALID_MAX_US;
+}
+
+// GPIO-IRQ capture (used at stage 0, or if PIO resources are unavailable).
 static void pwm_gpio_irq(uint gpio, uint32_t events) {
     uint32_t t = time_us_32();
     pwm_chan_t *ch;
@@ -134,8 +93,7 @@ static void pwm_gpio_irq(uint gpio, uint32_t events) {
     bool rise = (events & GPIO_IRQ_EDGE_RISE) != 0;
     bool fall = (events & GPIO_IRQ_EDGE_FALL) != 0;
 
-    // Both edges latched in one IRQ = we were too late to know the edge order/timing.
-    // Computing dt here would give 0 -> pulse_us = 0 -> full reverse. Drop it.
+    // Both edges latched in one IRQ: edge order/timing unknown (dt would be 0 -> full reverse).
     if (rise && fall) {
         ch->rise_valid = false;
         return;
@@ -148,13 +106,28 @@ static void pwm_gpio_irq(uint gpio, uint32_t events) {
     if (fall && ch->rise_valid) {
         ch->rise_valid = false;
         uint32_t dt = t - ch->rise_us;
-        if (dt >= PWM_VALID_MIN_US && dt <= PWM_VALID_MAX_US) {
+        if (pulse_valid(dt)) {
             ch->pulse_us = (uint16_t)dt;
             ch->last_update_us = t;
             ch->have_pulse = true;
         }
     }
 }
+
+#if FEAT_PIO_CAPTURE
+// Drain the PIO FIFOs into the same channel structs (called from the control tick, not an IRQ).
+static void pwm_pio_poll_all(void) {
+    pwm_chan_t *chans[3] = { &pwm_thr, &pwm_str, &pwm_en };
+    for (unsigned i = 0; i < 3; i++) {
+        uint16_t us;
+        if (pwm_capture_poll(i, &us) && pulse_valid(us)) {
+            chans[i]->pulse_us = us;
+            chans[i]->last_update_us = time_us_32();
+            chans[i]->have_pulse = true;
+        }
+    }
+}
+#endif
 
 typedef struct {
     uint16_t pulse_us;
@@ -190,63 +163,49 @@ static int32_t map_pwm(uint16_t us, int32_t max_abs) {
 }
 
 // ============================================================
-// LWP3 PACKETS
+// STEERING / DRIVE STATE
 // ============================================================
 
-// StartPower via WriteDirectModeData (0x51), mode 0
-static uint16_t lwp3_start_power(uint8_t port, int8_t power, uint8_t out[8]) {
-    out[0] = 8;
-    out[1] = 0x00;
-    out[2] = 0x81;
-    out[3] = port;
-    out[4] = LWP3_STARTUP_IMMEDIATE;
-    out[5] = 0x51;
-    out[6] = 0x00;
-    out[7] = (uint8_t)power;
-    return 8;
-}
+static const steer_map_params_t steer_map = {
+    .wheel_max_deg   = (float)STEER_TARGET_DEG_MAX,
+    .uncal_limit_deg = (STEER_TARGET_DEG_MAX * STEER_GEAR_RATIO < STEER_MOTOR_DEG_LIMIT)
+                         ? STEER_TARGET_DEG_MAX * STEER_GEAR_RATIO : STEER_MOTOR_DEG_LIMIT,
+    .curvature_map   = FEAT_STEER_CURVATURE,
+    .speed_gain      = FEAT_STEER_SPEED_GAIN,
+    .gain_min        = STEER_GAIN_MIN_PCT / 100.0f,
+    .fade_start_dps  = (float)STEER_GAIN_FADE_START_DPS,
+    .fade_end_dps    = (float)STEER_GAIN_FADE_END_DPS,
+};
 
-// GotoAbsolutePosition (0x0D): [AbsPos int32 LE][Speed][MaxPower][EndState][UseProfile]
-static uint16_t lwp3_goto_abs(uint8_t port, int32_t pos, int8_t speed, int8_t max_power,
-                              uint8_t end_state, uint8_t out[14]) {
-    uint32_t u = (uint32_t)pos;
-    out[0]  = 14;
-    out[1]  = 0x00;
-    out[2]  = 0x81;
-    out[3]  = port;
-    out[4]  = LWP3_STARTUP_IMMEDIATE;
-    out[5]  = 0x0D;
-    out[6]  = (uint8_t)(u & 0xFF);
-    out[7]  = (uint8_t)((u >> 8) & 0xFF);
-    out[8]  = (uint8_t)((u >> 16) & 0xFF);
-    out[9]  = (uint8_t)((u >> 24) & 0xFF);
-    out[10] = (uint8_t)speed;
-    out[11] = (uint8_t)max_power;
-    out[12] = end_state;
-    out[13] = 0x00;   // UseProfile = 0
-    return 14;
-}
+#if FEAT_STEER_AUTOCAL
+static const steer_cal_params_t steer_cal_params = {
+    .stall_deg           = STEER_CAL_STALL_DEG,
+    .stall_ms            = STEER_CAL_STALL_MS,
+    .min_run_ms          = STEER_CAL_MIN_RUN_MS,
+    .sweep_timeout_ms    = STEER_CAL_SWEEP_TIMEOUT_MS,
+    .feedback_timeout_ms = STEER_CAL_FEEDBACK_TIMEOUT_MS,
+    .min_half_deg        = STEER_CAL_MIN_HALF_DEG,
+    .max_half_deg        = STEER_CAL_MAX_HALF_DEG,
+    .margin_pct          = STEER_CAL_MARGIN_PCT,
+};
+#endif
 
-// Hub Properties (0x01): enable updates (0x02)
-static uint16_t lwp3_hub_prop_enable_updates(uint8_t prop, uint8_t out[5]) {
-    out[0] = 5; out[1] = 0x00; out[2] = 0x01; out[3] = prop; out[4] = 0x02;
-    return 5;
-}
-
-// Hub Alerts (0x03): enable updates (0x01)
-static uint16_t lwp3_hub_alert_enable(uint8_t alert, uint8_t out[5]) {
-    out[0] = 5; out[1] = 0x00; out[2] = 0x03; out[3] = alert; out[4] = 0x01;
-    return 5;
-}
+static dbw_sup_t sup;                  // sup.cal stays IDLE when auto-calibration is disabled
+static bool    have_steer_pos = false;
+static int32_t steer_pos = 0;
+static speed_est_t drive_speed;
 
 // ============================================================
 // OUTPUT CACHE (send on change + periodic refresh)
 // ============================================================
 
+typedef enum { OUT_NONE = 0, OUT_POWER, OUT_SPEED, OUT_GOTO } out_kind_t;
+
 typedef struct {
-    bool     valid;
-    int32_t  value;
-    uint32_t sent_ms;
+    bool       valid;
+    out_kind_t kind;
+    int32_t    value;
+    uint32_t   sent_ms;
 } out_cache_t;
 
 static out_cache_t out_a, out_b, out_steer;
@@ -257,18 +216,20 @@ static void out_cache_invalidate_all(void) {
     memset(&out_steer, 0, sizeof(out_steer));
 }
 
-static bool out_need_send(const out_cache_t *c, int32_t v, int32_t min_delta, uint32_t now) {
-    if (!c->valid) return true;
+static bool out_need_send(const out_cache_t *c, out_kind_t kind, int32_t v, int32_t min_delta,
+                          uint32_t now) {
+    if (!c->valid || c->kind != kind) return true;
     if (v != c->value) {
         int32_t d = v - c->value;
         if (d < 0) d = -d;
-        if (d >= min_delta || v == 0) return true;   // always honour exact stop / center
+        if (d >= min_delta || v == 0) return true;   // always honour exact stop / zero
     }
     return (now - c->sent_ms) >= OUTPUT_REFRESH_MS;
 }
 
-static void out_mark_sent(out_cache_t *c, int32_t v, uint32_t now) {
+static void out_mark_sent(out_cache_t *c, out_kind_t kind, int32_t v, uint32_t now) {
     c->valid = true;
+    c->kind = kind;
     c->value = v;
     c->sent_ms = now;
 }
@@ -298,38 +259,32 @@ static uint8_t service_count = 0;
 static uint8_t service_index = 0;
 static gatt_client_service_t current_service;
 
-// Selected handles
 static uint16_t write_value_handle = 0;
 static bool     write_is_wo_resp   = true;
 static gatt_client_characteristic_t notify_char;
-static bool     notify_char_found  = false;
 
-// Per-service candidates
 static uint16_t tmp_write_value_handle = 0;
 static bool     tmp_write_is_wo_resp   = false;
 static gatt_client_characteristic_t tmp_notify_char;
 static bool     tmp_notify_char_found  = false;
 static bool     tmp_exact_match        = false;
 
-// Heuristic fallback (first service with write+notify), used only if no exact UUID match
 static bool     fb_valid = false;
 static uint16_t fb_write_value_handle = 0;
 static bool     fb_write_is_wo_resp = false;
 static gatt_client_characteristic_t fb_notify_char;
 
-// Notifications
 static gatt_client_notification_t notif_listener;
 static bool notif_listening = false;
 
-// Hub init (battery / alerts subscription) progress
+// Hub init: subscriptions and motor settings sent once after READY
+#define HUB_INIT_STEPS 8
 static uint8_t hub_init_step = 0;
 
-// Stats
 static uint32_t tx_ok = 0, tx_drop = 0;
 static int      last_battery_pct = -1;
 
-// Buffer for write-with-response: BTstack keeps the pointer until the write completes,
-// so it must not live on the stack.
+// Buffer for write-with-response: BTstack keeps the pointer until the write completes.
 static uint8_t wr_resp_buf[20];
 
 static void gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -354,7 +309,6 @@ static void ble_reset_context(void) {
 
     write_value_handle = 0;
     write_is_wo_resp = true;
-    notify_char_found = false;
     memset(&notify_char, 0, sizeof(notify_char));
 
     tmp_write_value_handle = 0;
@@ -372,6 +326,11 @@ static void ble_reset_context(void) {
     last_battery_pct = -1;
     out_cache_invalidate_all();
 
+    // The hub may have been power-cycled: its encoder zero is gone, so calibrate again.
+    dbw_sup_link_lost(&sup);
+    have_steer_pos = false;
+    steer_pos = 0;
+    speed_est_reset(&drive_speed);
     ble_set_state(BLE_OFF);
 }
 
@@ -379,6 +338,10 @@ static inline bool ble_ready(void) {
     return (ble_state == BLE_READY) &&
            (conn_handle != HCI_CON_HANDLE_INVALID) &&
            (write_value_handle != 0);
+}
+
+static inline bool hub_init_done(void) {
+    return hub_init_step >= HUB_INIT_STEPS;
 }
 
 static inline bool adv_is_target(const bd_addr_t addr) {
@@ -457,6 +420,12 @@ static void gatt_start_service_discovery(void) {
     gatt_client_discover_primary_services(gatt_handler, conn_handle);
 }
 
+static void set_ready(void) {
+    ble_set_state(BLE_READY);
+    printf("[BLE] READY\n");
+    TELEM_EVENT(6 /* INFO */, "hub connected");
+}
+
 static void enable_notifications(void) {
     gatt_client_listen_for_characteristic_value_updates(&notif_listener, hub_notification_handler,
                                                         conn_handle, &notify_char);
@@ -468,7 +437,7 @@ static void enable_notifications(void) {
         GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
     if (st != ERROR_CODE_SUCCESS) {
         printf("[GATT] CCCD write not started (0x%02x) -> READY without notify\n", st);
-        ble_set_state(BLE_READY);
+        set_ready();
     }
 }
 
@@ -477,7 +446,6 @@ static void commit_selection(uint16_t wh, bool wo_resp, const gatt_client_charac
     write_value_handle = wh;
     write_is_wo_resp = wo_resp;
     notify_char = *nc;
-    notify_char_found = true;
     printf("[GATT] selected (%s): write=0x%04x (%s) notify=0x%04x\n",
            how, wh, wo_resp ? "WO_RESP" : "WRITE", nc->value_handle);
     enable_notifications();
@@ -589,8 +557,7 @@ static void gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
                     if (att != ATT_ERROR_SUCCESS) {
                         printf("[GATT] CCCD write failed att=0x%02x (continuing without notify)\n", att);
                     }
-                    ble_set_state(BLE_READY);
-                    printf("[BLE] READY\n");
+                    set_ready();
                     return;
 
                 case BLE_READY:
@@ -620,43 +587,53 @@ static void hub_notification_handler(uint8_t packet_type, uint16_t channel, uint
 
     uint16_t len = gatt_event_notification_get_value_length(packet);
     const uint8_t *v = gatt_event_notification_get_value(packet);
-    if (len < 3) return;
 
-    switch (v[2]) {
-        case 0x01: // Hub property update: [len][0][01][prop][06][payload]
-            if (len >= 6 && v[3] == 0x06 && v[4] == 0x06) {
-                int pct = v[5];
-                if (pct != last_battery_pct) {
-                    printf("[HUB] battery %d%%\n", pct);
-                    last_battery_pct = pct;
-                }
+    lwp3_msg_t m;
+    if (!lwp3_parse(v, len, &m)) return;
+
+    switch (m.type) {
+        case LWP3_MSG_BATTERY:
+            if (m.value != last_battery_pct) {
+                printf("[HUB] battery %ld%%\n", (long)m.value);
+                last_battery_pct = (int)m.value;
             }
             break;
 
-        case 0x03: // Hub alert: [len][0][03][type][04][00=ok / FF=alert]
-            if (len >= 6 && v[4] == 0x04) {
-                const char *name = (v[3] == 0x01) ? "LOW VOLTAGE" :
-                                   (v[3] == 0x02) ? "HIGH CURRENT" :
-                                   (v[3] == 0x03) ? "LOW SIGNAL" :
-                                   (v[3] == 0x04) ? "OVER POWER" : "?";
-                printf("[HUB] alert %s: %s\n", name, v[5] ? "ACTIVE" : "cleared");
+        case LWP3_MSG_ALERT: {
+            printf("[HUB] alert %s: %s\n", lwp3_alert_name(m.a), m.value ? "ACTIVE" : "cleared");
+            if (m.value) {
+                char t[40];
+                snprintf(t, sizeof(t), "hub alert %s", lwp3_alert_name(m.a));
+                TELEM_EVENT(4 /* WARNING */, t);
             }
             break;
+        }
 
-        case 0x04: // Hub attached I/O: [len][0][04][port][event][io_type LE]
-            if (len >= 5) {
-                uint16_t io = (len >= 7) ? (uint16_t)(v[5] | (v[6] << 8)) : 0;
-                printf("[HUB] port 0x%02x %s io_type=0x%04x\n", v[3],
-                       v[4] == 0 ? "detached" : (v[4] == 1 ? "attached" : "virtual"), io);
-            }
+        case LWP3_MSG_ATTACHED_IO:
+            printf("[HUB] port 0x%02x %s io_type=0x%04lx\n", m.a,
+                   m.b == 0 ? "detached" : (m.b == 1 ? "attached" : "virtual"), (unsigned long)m.value);
             break;
 
-        case 0x05: // Generic error: [len][0][05][cmd_type][error_code]
-            if (len >= 5) printf("[HUB] ERROR cmd=0x%02x code=0x%02x\n", v[3], v[4]);
+        case LWP3_MSG_ERROR:
+            printf("[HUB] ERROR cmd=0x%02x code=0x%02x\n", m.a, m.b);
+            break;
+
+        case LWP3_MSG_INPUT_FORMAT:
+            printf("[HUB] port 0x%02x mode %u notify=%ld\n", m.a, m.b, (long)m.value);
+            break;
+
+        case LWP3_MSG_PORT_VALUE:
+            if (m.a == LEGO_PORT_D) {
+                steer_pos = m.value;
+                have_steer_pos = true;
+            } else if (m.a == LEGO_PORT_A) {
+                speed_est_update(&drive_speed, m.value, btstack_run_loop_get_time_ms(),
+                                 SPEED_WINDOW_MS);
+            }
             break;
 
         default:
-            break;  // 0x82 port output feedback etc. ignored
+            break;
     }
 }
 
@@ -713,6 +690,9 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             printf("[BLE] disconnected 0x%02x (%s) tx_ok=%lu tx_drop=%lu -> rescan\n",
                    reason, disc_reason_str(reason),
                    (unsigned long)tx_ok, (unsigned long)tx_drop);
+            char t[40];
+            snprintf(t, sizeof(t), "hub disconnected 0x%02x", reason);
+            TELEM_EVENT(3 /* ERROR */, t);
             ble_reset_context();
             start_scan();
             break;
@@ -727,7 +707,7 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
 // ACTUATION
 // ============================================================
 
-// Returns true only if BTstack accepted the packet. Callers keep their "dirty" state on failure
+// Returns true only if BTstack accepted the packet. Callers keep their cached state on failure
 // and retry on the next tick (latest value wins; nothing is queued).
 static bool write_lwp3(const uint8_t *msg, uint16_t len) {
     if (!ble_ready()) return false;
@@ -751,36 +731,122 @@ static bool write_lwp3(const uint8_t *msg, uint16_t len) {
     return true;
 }
 
-static void set_drive(uint8_t port, out_cache_t *c, int32_t power, uint32_t now) {
-    if (!out_need_send(c, power, 1, now)) return;
-    uint8_t msg[8];
-    uint16_t len = lwp3_start_power(port, (int8_t)power, msg);
-    if (write_lwp3(msg, len)) out_mark_sent(c, power, now);
+// Drive motor command. Disarmed: power 0 (float), as in v1.0. Armed: open-loop power, or a
+// speed set-point for the hub's speed controller (FEAT_DRIVE_SPEED_LOOP).
+static void set_drive(uint8_t port, out_cache_t *c, bool armed, int32_t thr_cmd, uint32_t now) {
+    uint8_t msg[LWP3_MAX_MSG];
+    uint16_t len;
+    out_kind_t kind;
+    int32_t value;
+
+#if FEAT_DRIVE_SPEED_LOOP
+    if (armed) {
+        kind = OUT_SPEED;
+        value = (thr_cmd * DRIVE_SPEED_MAX_PCT) / 100;
+        if (!out_need_send(c, kind, value, 1, now)) return;
+        len = lwp3_start_speed(port, (int8_t)value, DRIVE_MAX_POWER,
+                               DRIVE_ACCEL_MS > 0 ? LWP3_PROFILE_ACC : 0, msg);
+        if (write_lwp3(msg, len)) out_mark_sent(c, kind, value, now);
+        return;
+    }
+#endif
+    kind = OUT_POWER;
+    value = armed ? thr_cmd : 0;
+    if (!out_need_send(c, kind, value, 1, now)) return;
+    len = lwp3_start_power(port, (int8_t)value, msg);
+    if (write_lwp3(msg, len)) out_mark_sent(c, kind, value, now);
 }
 
-static void set_steer(int32_t motor_deg, uint32_t now) {
-    if (!out_need_send(&out_steer, motor_deg, STEER_RESEND_DEG, now)) return;
-    uint8_t msg[14];
+static void set_steer_goto(int32_t motor_deg, uint32_t now) {
+    if (!out_need_send(&out_steer, OUT_GOTO, motor_deg, STEER_RESEND_DEG, now)) return;
+    uint8_t msg[LWP3_MAX_MSG];
     uint16_t len = lwp3_goto_abs(LEGO_PORT_D, motor_deg,
-                                 (int8_t)STEER_GOTO_SPEED, (int8_t)STEER_GOTO_MAXPOWER,
-                                 (uint8_t)STEER_ENDSTATE, msg);
-    if (write_lwp3(msg, len)) out_mark_sent(&out_steer, motor_deg, now);
+                                 (int8_t)STEER_GOTO_SPEED, STEER_GOTO_MAXPOWER,
+                                 STEER_ENDSTATE, 0, msg);
+    if (write_lwp3(msg, len)) out_mark_sent(&out_steer, OUT_GOTO, motor_deg, now);
 }
 
-// Subscribe to battery % and low-voltage / high-current alerts (diagnostics for brown-outs).
+#if FEAT_STEER_AUTOCAL
+static void set_steer_speed(int32_t speed, uint32_t now) {
+    if (!out_need_send(&out_steer, OUT_SPEED, speed, 1, now)) return;
+    uint8_t msg[LWP3_MAX_MSG];
+    uint16_t len = lwp3_start_speed(LEGO_PORT_D, (int8_t)speed, STEER_CAL_POWER, 0, msg);
+    if (write_lwp3(msg, len)) out_mark_sent(&out_steer, OUT_SPEED, speed, now);
+}
+#endif
+
+// One message per step, sent once after READY. Returns 0 for steps disabled at this stage.
+static uint16_t hub_init_build(uint8_t step, uint8_t *msg) {
+    switch (step) {
+        case 0: return lwp3_hub_prop_enable_updates(0x06, msg);    // battery %
+        case 1: return lwp3_hub_alert_enable(0x01, msg);           // low voltage
+        case 2: return lwp3_hub_alert_enable(0x02, msg);           // high current
+#if FEAT_MOTOR_FEEDBACK
+        case 3: return lwp3_input_format_setup(LEGO_PORT_D, LWP3_MODE_POS, 1, true, msg);
+        case 4: return lwp3_input_format_setup(LEGO_PORT_A, LWP3_MODE_POS,
+                                               DRIVE_POS_DELTA_DEG, true, msg);
+        // Ask for the current steering position explicitly, in case the hub only reports
+        // on change (calibration needs a position before the motor moves).
+        case 5: return lwp3_port_value_request(LEGO_PORT_D, msg);
+#endif
+#if FEAT_DRIVE_SPEED_LOOP
+        case 6: return DRIVE_ACCEL_MS > 0 ? lwp3_set_acc_time(LEGO_PORT_A, DRIVE_ACCEL_MS, msg) : 0;
+        case 7: return DRIVE_ACCEL_MS > 0 ? lwp3_set_acc_time(LEGO_PORT_B, DRIVE_ACCEL_MS, msg) : 0;
+#endif
+        default: return 0;
+    }
+}
+
 static void hub_init_service(void) {
-    while (hub_init_step < 3) {
-        uint8_t msg[5];
-        uint16_t len = 0;
-        switch (hub_init_step) {
-            case 0: len = lwp3_hub_prop_enable_updates(0x06, msg); break;  // battery voltage %
-            case 1: len = lwp3_hub_alert_enable(0x01, msg); break;         // low voltage
-            default: len = lwp3_hub_alert_enable(0x02, msg); break;        // high current
-        }
-        if (!write_lwp3(msg, len)) return;   // retry next tick
+    while (hub_init_step < HUB_INIT_STEPS) {
+        uint8_t msg[LWP3_MAX_MSG];
+        uint16_t len = hub_init_build(hub_init_step, msg);
+        if (len > 0 && !write_lwp3(msg, len)) return;   // retry next tick
         hub_init_step++;
     }
 }
+
+// ============================================================
+// STEERING CALIBRATION SUPERVISION
+// ============================================================
+
+#if FEAT_STEER_AUTOCAL
+static void report_cal_transition(steer_cal_state_t prev) {
+    if (sup.cal.state == prev) return;
+    char t[51];
+    switch (sup.cal.state) {
+        case STEER_CAL_SWEEP_NEG:
+            printf("[CAL] sweeping to first end-stop (start pos %ld)\n", (long)steer_pos);
+            break;
+        case STEER_CAL_SWEEP_POS:
+            printf("[CAL] end-stop A at %ld, sweeping to end-stop B\n", (long)sup.cal.end_neg);
+            break;
+        case STEER_CAL_DONE:
+            printf("[CAL] done: end-stops %ld / %ld, centre %ld, usable +/-%ld motor deg\n",
+                   (long)sup.cal.end_neg, (long)sup.cal.end_pos,
+                   (long)sup.cal.centre, (long)sup.cal.limit);
+            snprintf(t, sizeof(t), "steer cal ok, centre %ld range +/-%ld",
+                     (long)sup.cal.centre, (long)sup.cal.limit);
+            TELEM_EVENT(6 /* INFO */, t);
+            break;
+        case STEER_CAL_FAILED:
+            printf("[CAL] FAILED: %s -> uncalibrated steering (+/-%ld around power-on zero)\n",
+                   sup.cal.fail_reason ? sup.cal.fail_reason : "?",
+                   (long)steer_map.uncal_limit_deg);
+            TELEM_EVENT(4 /* WARNING */, "steer cal failed, uncalibrated");
+            break;
+        default:
+            break;
+    }
+}
+
+// Logs calibration events produced by the supervisor step.
+static void report_cal(const dbw_sup_out_t *o) {
+    if (o->cal_started) printf("[CAL] starting steering calibration\n");
+    if (o->cal_aborted) printf("[CAL] aborted (disarmed)\n");
+    report_cal_transition(o->prev_cal_state);
+}
+#endif
 
 // ============================================================
 // CONTROL LOOP (BTstack run-loop timer: same context as BTstack, NOT an IRQ)
@@ -798,6 +864,10 @@ static void control_tick(btstack_timer_source_t *ts) {
     uint32_t now = btstack_run_loop_get_time_ms();
     ble_supervise(now);
 
+#if FEAT_PIO_CAPTURE
+    if (pio_capture_active) pwm_pio_poll_all();
+#endif
+
     pwm_sample_t thr = pwm_sample(&pwm_thr);
     pwm_sample_t str = pwm_sample(&pwm_str);
     pwm_sample_t en  = pwm_sample(&pwm_en);
@@ -806,33 +876,80 @@ static void control_tick(btstack_timer_source_t *ts) {
     bool armed        = thr.fresh && str.fresh && enable_high;
     bool transport_ok = ble_ready();
 
-    // Safe defaults: stop + center
-    int32_t thr_cmd   = 0;
-    int32_t steer_cmd = 0;
-
+    // Safe defaults: stop + centre
+    int32_t thr_cmd = 0;
+    float   stick   = 0.0f;
     if (armed) {
         thr_cmd = map_pwm(thr.pulse_us, THROTTLE_MAX_POWER);
-        int32_t stick = map_pwm(str.pulse_us, 1000);   // [-1000..1000] for resolution
-        steer_cmd = (stick * STEER_TARGET_DEG_MAX * STEER_GEAR_RATIO) / 1000;
-        steer_cmd = clamp_i32(steer_cmd, -STEER_MOTOR_DEG_LIMIT, STEER_MOTOR_DEG_LIMIT);
+        stick   = (float)map_pwm(str.pulse_us, 1000) / 1000.0f;
     }
+
+    float speed = FEAT_MOTOR_FEEDBACK ? speed_est_get(&drive_speed, now, SPEED_TIMEOUT_MS) : 0.0f;
+
+#if FEAT_STEER_AUTOCAL
+    // Calibration sequencing and drive interlock (rules in supervisor.h)
+    dbw_sup_in_t sin = {
+        .now_ms = now, .armed = armed, .link_ready = transport_ok,
+        .hub_init_done = hub_init_done(), .have_pos = have_steer_pos, .pos = steer_pos,
+        .thr_cmd = thr_cmd,
+    };
+    dbw_sup_out_t sout;
+    dbw_sup_step(&sup, &steer_cal_params, &sin, &sout);
+    report_cal(&sout);
+    steer_cal_cmd_t cal_cmd = sout.cal_cmd;
+    thr_cmd = sout.thr_cmd;
+#endif
+
+    int32_t steer_abs = steer_target(&steer_map, &sup.cal, stick, speed);
+    int32_t centre = (sup.cal.state == STEER_CAL_DONE) ? sup.cal.centre : 0;
 
     if (transport_ok) {
         // drive first: stop commands have priority over steering
-        set_drive(LEGO_PORT_A, &out_a, thr_cmd, now);
-        set_drive(LEGO_PORT_B, &out_b, thr_cmd, now);
-        set_steer(steer_cmd, now);
+        set_drive(LEGO_PORT_A, &out_a, armed, thr_cmd, now);
+        set_drive(LEGO_PORT_B, &out_b, armed, thr_cmd, now);
+#if FEAT_STEER_AUTOCAL
+        if (cal_cmd == STEER_CAL_CMD_RUN_NEG)      set_steer_speed(-STEER_CAL_SPEED, now);
+        else if (cal_cmd == STEER_CAL_CMD_RUN_POS) set_steer_speed(STEER_CAL_SPEED, now);
+        else if (cal_cmd == STEER_CAL_CMD_HOLD)    set_steer_speed(0, now);
+        else
+#endif
+        set_steer_goto(steer_abs, now);
         hub_init_service();
     }
 
+#if FEAT_TELEMETRY
+    telem_snapshot_t snap = {
+        .link_ready    = transport_ok,
+        .armed         = armed,
+        .thr_cmd       = thr_cmd,
+        .steer_rel_deg = steer_abs - centre,
+        .steer_pos_deg = have_steer_pos ? steer_pos - centre : INT32_MIN,
+        .speed_dps     = speed,
+        .battery_pct   = last_battery_pct,
+        .cal_state     = (int32_t)sup.cal.state,
+        .tx_drop       = tx_drop,
+    };
+    telem_tick(now, &snap);
+#endif
+
     if ((++diag_counter % CONTROL_HZ) == 0) {
-        printf("[DBG] ble=%d st=%d | thr=%u%s str=%u%s en=%u%s | armed=%d | thr_cmd=%ld steer=%ldmdeg | tx ok=%lu drop=%lu\n",
+        printf("[DBG] ble=%d st=%d | thr=%u%s str=%u%s en=%u%s | armed=%d | thr_cmd=%ld steer=%ld",
                (int)transport_ok, (int)ble_state,
                (unsigned)thr.pulse_us, thr.fresh ? "" : "(stale)",
                (unsigned)str.pulse_us, str.fresh ? "" : "(stale)",
                (unsigned)en.pulse_us,  en.fresh  ? "" : "(stale)",
-               (int)armed, (long)thr_cmd, (long)steer_cmd,
-               (unsigned long)tx_ok, (unsigned long)tx_drop);
+               (int)armed, (long)thr_cmd, (long)(steer_abs - centre));
+#if FEAT_MOTOR_FEEDBACK
+        if (have_steer_pos) printf(" pos=%ld", (long)(steer_pos - centre));
+        else                printf(" pos=?");
+        printf(" spd=%ld", (long)speed);
+#endif
+#if FEAT_STEER_AUTOCAL
+        printf(" cal=%s%s", steer_cal_state_name(sup.cal.state), sup.drive_interlock ? " lock" : "");
+        if (armed && sup.cal.state == STEER_CAL_IDLE && !sup.cal_requested)
+            printf(" (flip enable off/on to calibrate)");
+#endif
+        printf(" | tx ok=%lu drop=%lu\n", (unsigned long)tx_ok, (unsigned long)tx_drop);
     }
 }
 
@@ -850,8 +967,20 @@ int main(void) {
     }
     sleep_ms(200);
 
-    printf("\n=== LEGO DBW Pico W v1.0 ===\n");
-    if (watchdog_caused_reboot()) printf("[BOOT] *** previous run was reset by WATCHDOG ***\n");
+    printf("\n=== LEGO DBW Pico W %s (stage %d) ===\n", DBW_VERSION, DBW_STAGE);
+    printf("features: pio=%d telem=%d feedback=%d autocal=%d curvature=%d speedloop=%d speedgain=%d\n",
+           FEAT_PIO_CAPTURE, FEAT_TELEMETRY, FEAT_MOTOR_FEEDBACK, FEAT_STEER_AUTOCAL,
+           FEAT_STEER_CURVATURE, FEAT_DRIVE_SPEED_LOOP, FEAT_STEER_SPEED_GAIN);
+    bool wd_reboot = watchdog_caused_reboot();
+    if (wd_reboot) printf("[BOOT] *** previous run was reset by WATCHDOG ***\n");
+
+#if FEAT_TELEMETRY
+    telem_init();
+    if (wd_reboot) telem_event(2 /* CRITICAL */, "gateway rebooted by watchdog");
+#endif
+
+    dbw_sup_init(&sup);
+    speed_est_reset(&drive_speed);
 
     // PWM inputs
     const uint pins[3] = { GPIO_PWM_THROTTLE, GPIO_PWM_STEERING, GPIO_PWM_ENABLE };
@@ -860,10 +989,6 @@ int main(void) {
         gpio_set_dir(pins[i], GPIO_IN);
         gpio_pull_down(pins[i]);
     }
-    gpio_set_irq_enabled_with_callback(GPIO_PWM_THROTTLE,
-        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &pwm_gpio_irq);
-    gpio_set_irq_enabled(GPIO_PWM_STEERING, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(GPIO_PWM_ENABLE,   GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 
     if (cyw43_arch_init()) {
         printf("ERROR: cyw43_arch_init failed\n");
@@ -872,6 +997,20 @@ int main(void) {
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     sleep_ms(100);
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+
+    // PWM capture backend: PIO (claimed after the CYW43 driver took its PIO), else GPIO IRQ.
+#if FEAT_PIO_CAPTURE
+    const unsigned cap_pins[3] = { GPIO_PWM_THROTTLE, GPIO_PWM_STEERING, GPIO_PWM_ENABLE };
+    pio_capture_active = pwm_capture_init(cap_pins);
+    if (!pio_capture_active) printf("[PWM] PIO unavailable -> falling back to GPIO IRQ capture\n");
+#endif
+    if (!pio_capture_active) {
+        gpio_set_irq_enabled_with_callback(GPIO_PWM_THROTTLE,
+            GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &pwm_gpio_irq);
+        gpio_set_irq_enabled(GPIO_PWM_STEERING, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+        gpio_set_irq_enabled(GPIO_PWM_ENABLE,   GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    }
+    printf("[PWM] capture: %s\n", pio_capture_active ? "PIO" : "GPIO IRQ");
 
     l2cap_init();
     sm_init();
